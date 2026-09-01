@@ -1,0 +1,763 @@
+syntax = "proto3";
+option go_package = "./proto";
+
+package proto;
+
+service SantaiziService {
+    rpc ReportSystemState(State)returns(Receipt){}
+    rpc ReportSystemInfo(Host)returns(Receipt){}
+    rpc LookupGeoIP(GeoIP)returns(GeoIP){}
+}
+
+service SantaiziTelemetryService {
+    rpc Ingest(stream TelemetryRequest) returns(stream TelemetryResponse){}
+}
+
+service SantaiziControlService {
+    rpc Control(stream AgentControlRequest) returns(stream PrimaryControlResponse){}
+}
+
+service SantaiziNATService {
+    rpc NATStream(stream NATFrame) returns(stream NATFrame){}
+}
+
+service SantaiziReplicationService {
+    rpc Replicate(stream ReplicationBatch) returns(stream ReplicationAck){}
+}
+
+service SantaiziCollectorService {
+    rpc Register(RegisterCollectorRequest) returns(RegisterCollectorResponse){}
+    rpc Sync(stream CollectorSyncRequest) returns(stream CollectorSyncResponse){}
+    rpc GetStatus(CollectorStatusRequest) returns(CollectorStatus){}
+    rpc RenewCollector(CollectorRenewRequest) returns(CollectorEnrollResponse){}
+}
+
+service SantaiziEnrollmentService {
+    rpc Enroll(AgentEnrollRequest) returns(AgentEnrollResponse){}
+    rpc Renew(AgentRenewRequest) returns(AgentEnrollResponse){}
+}
+
+enum TelemetryEventType {
+    TELEMETRY_EVENT_TYPE_UNSPECIFIED = 0;
+    TELEMETRY_EVENT_TYPE_HEARTBEAT = 1;
+    TELEMETRY_EVENT_TYPE_STATE = 2;
+    TELEMETRY_EVENT_TYPE_HOST = 3;
+    TELEMETRY_EVENT_TYPE_LIFECYCLE = 4;
+    TELEMETRY_EVENT_TYPE_STATE_ROLLUP = 5;
+    TELEMETRY_EVENT_TYPE_DATA_LOSS = 6;
+}
+
+enum TelemetryPriority {
+    TELEMETRY_PRIORITY_UNSPECIFIED = 0;
+    TELEMETRY_PRIORITY_P0_CRITICAL = 1;
+    TELEMETRY_PRIORITY_P1_IMPORTANT = 2;
+    TELEMETRY_PRIORITY_P2_NORMAL = 3;
+    TELEMETRY_PRIORITY_P3_OPTIONAL = 4;
+}
+
+enum SourceProtocol {
+    SOURCE_PROTOCOL_UNSPECIFIED = 0;
+    SOURCE_PROTOCOL_SANTAIZI_V2 = 1;
+    reserved 2, 3;
+}
+
+enum Reliability {
+    RELIABILITY_UNSPECIFIED = 0;
+    RELIABILITY_RELIABLE_REPLAY = 1;
+    RELIABILITY_BEST_EFFORT = 2;
+}
+
+enum GapReason {
+    GAP_REASON_UNSPECIFIED = 0;
+    GAP_REASON_COMPACTED = 1;
+    GAP_REASON_HARD_LIMIT_DATA_LOSS = 2;
+    GAP_REASON_CORRUPTION = 3;
+}
+
+enum CollectorKind {
+    COLLECTOR_KIND_UNSPECIFIED = 0;
+    COLLECTOR_KIND_OBSERVER = 1;
+    COLLECTOR_KIND_PROBE = 2;
+}
+
+enum LifecycleKind {
+    LIFECYCLE_KIND_UNSPECIFIED = 0;
+    LIFECYCLE_KIND_AGENT_STARTED = 1;
+    LIFECYCLE_KIND_AGENT_STOPPED = 2;
+    LIFECYCLE_KIND_HOST_BOOT = 3;
+    LIFECYCLE_KIND_AGENT_IDENTITY_CHANGED = 4;
+}
+
+enum EndpointKind {
+    ENDPOINT_KIND_UNSPECIFIED = 0;
+    ENDPOINT_KIND_PRIMARY = 1;
+    ENDPOINT_KIND_COLLECTOR = 2;
+}
+
+enum WalPressure {
+    WAL_PRESSURE_UNSPECIFIED = 0;
+    WAL_PRESSURE_HEALTHY = 1;
+    WAL_PRESSURE_P3_DOWNSAMPLED = 2;
+    WAL_PRESSURE_ROLLUP = 3;
+    WAL_PRESSURE_CRITICAL = 4;
+    WAL_PRESSURE_DATA_LOSS = 5;
+}
+
+enum AgentCapability {
+    AGENT_CAPABILITY_UNSPECIFIED = 0;
+    AGENT_CAPABILITY_METRIC_CPU = 1;
+    AGENT_CAPABILITY_METRIC_MEMORY = 2;
+    AGENT_CAPABILITY_METRIC_DISK = 3;
+    AGENT_CAPABILITY_METRIC_NETWORK = 4;
+    AGENT_CAPABILITY_METRIC_CONNECTIONS = 5;
+    AGENT_CAPABILITY_METRIC_PROCESSES = 6;
+    AGENT_CAPABILITY_METRIC_TEMPERATURE = 7;
+    AGENT_CAPABILITY_METRIC_GPU = 8;
+    AGENT_CAPABILITY_HOST_INFO = 9;
+    AGENT_CAPABILITY_IP_REPORT = 10;
+    AGENT_CAPABILITY_PROBE_HTTP = 11;
+    AGENT_CAPABILITY_PROBE_ICMP = 12;
+    AGENT_CAPABILITY_PROBE_TCP = 13;
+    AGENT_CAPABILITY_NAT = 14;
+}
+
+enum ProbeKind {
+    PROBE_KIND_UNSPECIFIED = 0;
+    PROBE_KIND_HTTP = 1;
+    PROBE_KIND_ICMP = 2;
+    PROBE_KIND_TCP = 3;
+}
+
+enum NATFrameKind {
+    NAT_FRAME_KIND_UNSPECIFIED = 0;
+    NAT_FRAME_KIND_OPEN = 1;
+    NAT_FRAME_KIND_DATA = 2;
+    NAT_FRAME_KIND_CLOSE = 3;
+    NAT_FRAME_KIND_ERROR = 4;
+}
+
+message TelemetryEvent {
+    bytes event_id = 1;
+    bytes node_uuid = 2;
+    bytes session_id = 3;
+    uint64 sequence = 4;
+    TelemetryEventType event_type = 5;
+    TelemetryPriority priority = 6;
+    int64 collected_at_unix_nano = 7;
+    uint64 agent_uptime_nano = 8;
+    uint64 session_elapsed_nano = 9;
+    uint32 protocol_version = 10;
+    SourceProtocol source_protocol = 11;
+    Reliability reliability = 12;
+    oneof payload {
+        HeartbeatPayload heartbeat = 20;
+        State state = 21;
+        Host host = 22;
+        LifecyclePayload lifecycle = 23;
+        StateRollupPayload state_rollup = 24;
+        DataLossPayload data_loss = 25;
+    }
+}
+
+message HeartbeatPayload {
+    uint64 boot_time_unix = 1;
+}
+
+message LifecyclePayload {
+    LifecycleKind kind = 1;
+    string reason = 2;
+    bytes previous_node_uuid = 3;
+}
+
+message StateRollupPayload {
+    int64 window_start_unix_nano = 1;
+    int64 window_end_unix_nano = 2;
+    uint32 sample_count = 3;
+    State minimum = 4;
+    State average = 5;
+    State maximum = 6;
+    uint64 net_in_total = 7;
+    uint64 net_out_total = 8;
+}
+
+message DataLossPayload {
+    GapReason reason = 1;
+    string component = 2;
+    string detail = 3;
+    uint64 lost_records = 4;
+}
+
+message SequenceGap {
+    bytes gap_id = 1;
+    bytes node_uuid = 2;
+    bytes session_id = 3;
+    uint64 start_sequence = 4;
+    uint64 end_sequence = 5;
+    GapReason reason = 6;
+    bytes replacement_event_id = 7;
+    int64 created_at_unix_nano = 8;
+}
+
+message TelemetryRecord {
+    oneof record {
+        TelemetryEvent event = 1;
+        SequenceGap gap = 2;
+    }
+}
+
+message SignedAgentCredential {
+    bytes claims = 1;
+    bytes signature = 2;
+    bytes key_id = 3;
+}
+
+message AgentCredentialClaims {
+    bytes node_uuid = 1;
+    int64 issued_at_unix = 2;
+    int64 expires_at_unix = 3;
+    string capability = 4;
+    uint64 config_version = 5;
+}
+
+message TelemetryHello {
+    bytes node_uuid = 1;
+    string endpoint_id = 2;
+    uint64 assignment_generation = 3;
+    SignedAgentCredential credential = 4;
+    string protocol_version = 5;
+    AgentRuntime agent_runtime = 6;
+}
+
+message TelemetryBatch {
+    repeated TelemetryRecord records = 1;
+}
+
+message RealtimeSnapshot {
+    bytes node_uuid = 1;
+    bytes session_id = 2;
+    uint64 latest_sequence = 3;
+    int64 collected_at_unix_nano = 4;
+    uint64 agent_uptime_nano = 5;
+    Host host = 6;
+    State state = 7;
+    AgentRuntime agent_runtime = 8;
+}
+
+message TelemetryPing {}
+
+message TelemetryPong {}
+
+message TelemetryRequest {
+    oneof body {
+        TelemetryHello hello = 1;
+        TelemetryBatch batch = 2;
+        RealtimeSnapshot realtime_snapshot = 3;
+        TelemetryPing ping = 4;
+    }
+}
+
+message SessionAck {
+    bytes node_uuid = 1;
+    bytes session_id = 2;
+    uint64 ack_through = 3;
+}
+
+message TelemetryResponse {
+    repeated SessionAck acks = 1;
+    repeated bytes accepted_gap_ids = 2;
+    string error = 3;
+    TelemetryPong pong = 4;
+}
+
+message SinkRuntime {
+    string endpoint_id = 1;
+    uint64 generation = 2;
+    bool connected = 3;
+    uint64 ack_through = 4;
+    uint64 pending_events = 5;
+    int64 oldest_pending_unix_nano = 6;
+    string last_error = 7;
+    double last_rtt_ms = 8;
+    int64 rtt_sampled_at_unix_nano = 9;
+}
+
+message AgentRuntime {
+    WalPressure wal_pressure = 1;
+    uint64 wal_bytes = 2;
+    uint64 pending_events = 3;
+    int64 oldest_pending_unix_nano = 4;
+    repeated SinkRuntime sinks = 5;
+    bool clock_untrusted = 6;
+    string protocol_version = 7;
+    AgentCapabilities capabilities = 8;
+}
+
+message AgentCapabilities {
+    repeated AgentCapability enabled = 1;
+}
+
+message TelemetryEndpoint {
+    string endpoint_id = 1;
+    EndpointKind kind = 2;
+    string address = 3;
+    bool reliable = 4;
+    bool tls = 5;
+    bool insecure_tls = 6;
+    uint64 generation = 7;
+    bytes activation_session_id = 8;
+    uint64 activation_sequence = 9;
+}
+
+message EndpointAssignment {
+    uint64 config_version = 1;
+    repeated TelemetryEndpoint endpoints = 2;
+}
+
+message AgentControlHello {
+    bytes node_uuid = 1;
+    bytes session_id = 2;
+    uint64 current_config_version = 3;
+    string agent_version = 4;
+    Host host = 5;
+    AgentCapabilities capabilities = 6;
+}
+
+message AgentControlRequest {
+    oneof body {
+        AgentControlHello hello = 1;
+        ProbeResult probe_result = 2;
+        AgentRuntime runtime = 3;
+        NATOpenResult nat_open_result = 4;
+    }
+}
+
+message PrimaryControlResponse {
+    oneof body {
+        EndpointAssignment assignment = 1;
+        SignedAgentCredential credential = 2;
+        ProbeRequest probe_request = 3;
+        NATOpenRequest nat_open_request = 4;
+    }
+}
+
+message ProbeRequest {
+    string probe_id = 1;
+    oneof target {
+        HTTPProbeRequest http = 10;
+        ICMPProbeRequest icmp = 11;
+        TCPProbeRequest tcp = 12;
+    }
+}
+
+message HTTPProbeRequest {
+    string url = 1;
+    uint32 timeout_ms = 2;
+}
+
+message ICMPProbeRequest {
+    string host = 1;
+    uint32 count = 2;
+    uint32 timeout_ms = 3;
+}
+
+message TCPProbeRequest {
+    string host = 1;
+    uint32 port = 2;
+    uint32 timeout_ms = 3;
+}
+
+message ProbeResult {
+    string probe_id = 1;
+    ProbeKind kind = 2;
+    bool successful = 3;
+    double delay_ms = 4;
+    string error = 5;
+    int64 completed_at_unix_nano = 6;
+    oneof detail {
+        HTTPProbeResult http = 10;
+        ICMPProbeResult icmp = 11;
+        TCPProbeResult tcp = 12;
+    }
+}
+
+message HTTPProbeResult {
+    uint32 status_code = 1;
+    string tls_issuer = 2;
+    int64 tls_expires_at_unix = 3;
+}
+
+message ICMPProbeResult {
+    uint32 packets_sent = 1;
+    uint32 packets_received = 2;
+}
+
+message TCPProbeResult {
+    string resolved_ip = 1;
+}
+
+message NATOpenRequest {
+    string stream_id = 1;
+    string target_host = 2;
+    uint32 target_port = 3;
+    int64 expires_at_unix = 4;
+}
+
+message NATOpenResult {
+    string stream_id = 1;
+    bool accepted = 2;
+    string error = 3;
+}
+
+message NATFrame {
+    string stream_id = 1;
+    NATFrameKind kind = 2;
+    bytes data = 3;
+    string error = 4;
+}
+
+message TelemetryObservation {
+    bytes event_id = 1;
+    string observer_id = 2;
+    int64 received_at_unix_nano = 3;
+    int64 replicated_at_unix_nano = 4;
+    bytes metadata = 5;
+}
+
+message ObserverHealthSample {
+    string observer_id = 1;
+    int64 sampled_at_unix_nano = 2;
+    bool healthy = 3;
+    string process_session = 4;
+}
+
+message CollectorRuntime {
+    string collector_uuid = 1;
+    int64 sampled_at_unix_nano = 2;
+    uint64 spool_size = 3;
+    uint64 pending_records = 4;
+    int64 oldest_pending_unix_nano = 5;
+    uint64 replication_cursor = 6;
+    uint64 connected_agents = 7;
+    string protocol_version = 8;
+    int64 last_primary_seen_unix_nano = 9;
+    double heartbeat_rtt_ms = 10;
+    int64 heartbeat_rtt_sampled_at_unix_nano = 11;
+    double replication_rtt_ms = 12;
+    int64 replication_rtt_sampled_at_unix_nano = 13;
+    string software_version = 14;
+}
+
+message ReplicationBatch {
+    string collector_uuid = 1;
+    bytes replication_session = 2;
+    uint64 batch_sequence = 3;
+    uint64 spool_through_id = 4;
+    repeated TelemetryEvent events = 5;
+    repeated TelemetryObservation observations = 6;
+    repeated SequenceGap gaps = 7;
+    repeated ObserverHealthSample health = 8;
+    CollectorRuntime runtime = 9;
+    repeated CollectorDataLossFact data_loss = 10;
+}
+
+message CollectorDataLossFact {
+    bytes fact_id = 1;
+    string collector_uuid = 2;
+    int64 occurred_at_unix_nano = 3;
+    GapReason reason = 4;
+    uint64 first_spool_id = 5;
+    uint64 last_spool_id = 6;
+    uint64 lost_records = 7;
+    string detail = 8;
+}
+
+message ReplicationAck {
+    string collector_uuid = 1;
+    bytes replication_session = 2;
+    uint64 batch_sequence = 3;
+    uint64 committed_spool_through_id = 4;
+    string error = 5;
+}
+
+message RegisterCollectorRequest {
+    string registration_token = 1;
+    string protocol_version = 2;
+    bytes csr_der = 3;
+}
+
+message RegisterCollectorResponse {
+    string collector_uuid = 1;
+    bytes primary_public_key = 2;
+    bytes key_id = 3;
+    uint64 config_version = 4;
+    string agent_ca_certificate_pem = 5;
+    string collector_certificate_pem = 6;
+    string collector_ca_certificate_pem = 7;
+    int64 not_before_unix = 8;
+    int64 expires_at_unix = 9;
+}
+
+message CollectorRenewRequest {
+    string collector_uuid = 1;
+    bytes csr_der = 2;
+}
+
+message CollectorEnrollResponse {
+    string certificate_pem = 1;
+    string ca_certificate_pem = 2;
+    string agent_ca_certificate_pem = 3;
+    int64 not_before_unix = 4;
+    int64 expires_at_unix = 5;
+}
+
+message AgentEnrollRequest {
+    bytes node_uuid = 1;
+    bytes csr_der = 2;
+    string agent_version = 3;
+}
+
+message AgentRenewRequest {
+    bytes node_uuid = 1;
+    bytes csr_der = 2;
+    string agent_version = 3;
+}
+
+message AgentEnrollResponse {
+    string certificate_pem = 1;
+    string ca_certificate_pem = 2;
+    int64 not_before_unix = 3;
+    int64 expires_at_unix = 4;
+}
+
+message CollectorSyncHello {
+    string collector_uuid = 1;
+    string registration_token = 2;
+    uint64 current_config_version = 3;
+    CollectorRuntime runtime = 4;
+}
+
+message NodeAssignment {
+    bytes node_uuid = 1;
+    string observer_id = 2;
+    int64 valid_from_unix_nano = 3;
+    int64 valid_to_unix_nano = 4;
+    uint64 generation = 5;
+    uint64 config_version = 6;
+}
+
+message ProbeTarget {
+    uint64 server_id = 1;
+    string server_name = 2;
+    string ipv4 = 3;
+    string ipv6 = 4;
+    string hostname = 5;
+    repeated uint32 tcp_ports = 6;
+    bool enable_icmp = 7;
+    bool enable_tcp = 8;
+    bool enable_mtr = 9;
+    uint32 interval_seconds = 10;
+    uint32 mtr_interval_seconds = 11;
+    uint32 route_interval_seconds = 12;
+    uint32 mtr_probes = 13;
+}
+
+enum ProbeIPFamily {
+    PROBE_IP_FAMILY_UNSPECIFIED = 0;
+    PROBE_IP_FAMILY_IPV4 = 1;
+    PROBE_IP_FAMILY_IPV6 = 2;
+}
+
+message ProbeConfig {
+    CollectorKind kind = 1;
+    uint32 interval_seconds = 2;
+    uint32 mtr_interval_seconds = 3;
+    repeated uint32 tcp_ports = 4;
+    bool enable_icmp = 5;
+    bool enable_tcp = 6;
+    bool enable_mtr = 7;
+    bool notify = 8;
+    string notification_tag = 9;
+    bool latency_notify = 10;
+    double min_latency_ms = 11;
+    double max_latency_ms = 12;
+    uint32 fail_threshold = 13;
+    repeated ProbeIPFamily ip_families = 14;
+    uint32 route_interval_seconds = 15;
+    uint32 route_keep = 16;
+    uint32 mtr_probes = 17;
+}
+
+message ProbeICMPSample {
+    bool ok = 1;
+    double rtt_ms = 2;
+    double loss = 3;
+    uint32 packets_sent = 4;
+    uint32 packets_received = 5;
+    string error = 6;
+}
+
+message ProbeTCPSample {
+    uint32 port = 1;
+    bool ok = 2;
+    double rtt_ms = 3;
+    string error = 4;
+}
+
+message ProbeMTRHop {
+    uint32 ttl = 1;
+    string address = 2;
+    double loss = 3;
+    double avg_ms = 4;
+    uint32 sent = 5;
+}
+
+message ProbeMTRTrace {
+    int64 sampled_at_unix_nano = 1;
+    string destination = 2;
+    repeated ProbeMTRHop hops = 3;
+    string protocol = 4;
+    uint32 port = 5;
+}
+
+message ProbeRouteHop {
+    uint32 ttl = 1;
+    string address = 2;
+    string hostname = 3;
+    double rtt_ms = 4;
+    double loss = 5;
+    uint32 sent = 6;
+    string asn = 7;
+    string country = 8;
+    string province = 9;
+    string city = 10;
+    string owner = 11;
+}
+
+message ProbeRouteTrace {
+    int64 sampled_at_unix_nano = 1;
+    string destination = 2;
+    string protocol = 3;
+    uint32 port = 4;
+    repeated ProbeRouteHop hops = 5;
+    string error = 6;
+    uint64 job_id = 7;
+}
+
+message ProbeSample {
+    uint64 server_id = 1;
+    int64 sampled_at_unix_nano = 2;
+    ProbeICMPSample icmp = 3;
+    repeated ProbeTCPSample tcp = 4;
+    ProbeMTRTrace mtr = 5;
+    string last_error = 6;
+    ProbeMTRTrace mtr_tcp = 7;
+    ProbeRouteTrace route_icmp = 8;
+    ProbeRouteTrace route_tcp = 9;
+}
+
+message ProbeSampleBatch {
+    repeated ProbeSample samples = 1;
+}
+
+message CollectorAuthorizationConfig {
+    uint64 config_version = 1;
+    bytes primary_public_key = 2;
+    bytes key_id = 3;
+    repeated bytes revoked_node_uuids = 4;
+    repeated NodeAssignment assignments = 5;
+    string agent_ca_certificate_pem = 6;
+    CollectorKind kind = 7;
+    ProbeConfig probe = 8;
+    repeated ProbeTarget targets = 9;
+}
+
+message CollectorSyncRequest {
+    oneof body {
+        CollectorSyncHello hello = 1;
+        CollectorRuntime runtime = 2;
+        ProbeSampleBatch probe_samples = 3;
+    }
+}
+
+message ProbeRouteJob {
+    uint64 job_id = 1;
+    uint64 server_id = 2;
+    string protocol = 3;
+    uint32 port = 4;
+}
+
+message ProbeRouteJobBatch {
+    repeated ProbeRouteJob jobs = 1;
+}
+
+message CollectorSyncResponse {
+    oneof body {
+        CollectorAuthorizationConfig config = 1;
+        bool accepted = 2;
+        ProbeRouteJobBatch route_jobs = 3;
+    }
+}
+
+message CollectorStatusRequest {
+    string authorization = 1;
+}
+
+message CollectorStatus {
+    uint64 connected_agents = 1;
+    uint64 spool_size = 2;
+    uint64 pending_records = 3;
+    int64 oldest_pending_unix_nano = 4;
+    uint64 replication_cursor = 5;
+    int64 last_primary_seen_unix_nano = 6;
+    string protocol_version = 7;
+}
+
+message Host {
+    string platform = 1;
+    string platform_version = 2;
+    repeated string cpu = 3;
+    uint64 mem_total = 4;
+    uint64 disk_total = 5;
+    uint64 swap_total = 6;
+    string arch = 7;
+    string virtualization = 8;
+    uint64 boot_time = 9;
+    string ip = 10;
+    string country_code = 11; // deprecated
+    string version = 12;
+    repeated string gpu = 13;
+}
+
+message State {
+    double cpu = 1;
+    uint64 mem_used = 3;
+    uint64 swap_used = 4;
+    uint64 disk_used = 5;
+    uint64 net_in_transfer = 6;
+    uint64 net_out_transfer = 7;
+    uint64 net_in_speed = 8;
+    uint64 net_out_speed = 9;
+    uint64 uptime = 10;
+    double load1 = 11;
+    double load5 = 12;
+    double load15 = 13;
+    uint64 tcp_conn_count = 14;
+    uint64 udp_conn_count = 15;
+    uint64 process_count = 16;
+    repeated State_SensorTemperature temperatures = 17;
+    double gpu = 18;
+}
+
+message State_SensorTemperature {
+    string name = 1;
+    double temperature = 2;
+}
+
+message Receipt {
+    bool proced = 1;
+}
+
+message GeoIP {
+    string ip = 1;
+    string country_code = 2;
+}

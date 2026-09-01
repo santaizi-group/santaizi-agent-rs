@@ -1,0 +1,30 @@
+# 三太子 Rust 探针配置（Go 探针键名对齐的子集）
+server: "localhost:5555"
+client_secret: ""
+
+# 上报通路：v2（默认，Control+Ingest 流，对齐 Go 探针）或 v1（unary 回退）
+protocol: "v2"
+
+# gRPC TLS（面板 grpc_tls.enabled 时打开）
+tls: false
+# 自签 CA 证书路径（PEM）
+# tls_ca_file: ""
+# MVP 暂不支持跳过证书校验
+# insecure_tls: false
+
+# State 上报间隔秒数（1-3600，仅 v1 通路）
+report_delay: 5
+# IP/归属地自查周期秒数（>=60）
+ip_report_period: 1800
+# 固定国家码（可选，覆盖自查）
+# country_code: ""
+
+# v2 通路
+telemetry:
+  data_dir: "/var/lib/santaizi-agent"
+  state_interval: 5
+  heartbeat_interval: 10
+  host_interval: 600
+  batch_size: 256
+
+debug: false

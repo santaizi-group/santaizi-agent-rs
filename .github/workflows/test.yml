@@ -1,0 +1,56 @@
+name: Run Tests
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  pull_request:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: santaizi-group/santaizi-agent
+          path: upstream-agent
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check vendored proto
+        run: |
+          set -euo pipefail
+          if ! diff -u proto/santaizi.proto upstream-agent/proto/santaizi.proto; then
+            echo "proto/santaizi.proto drifted from santaizi-agent/proto/santaizi.proto" >&2
+            echo "Copy the upstream file into this repo's proto/ and commit." >&2
+            exit 1
+          fi
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked

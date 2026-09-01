@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+          - target: aarch64-unknown-linux-gnu
+            goos: linux
+            goarch: arm64
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Invalid tag: $tag"
+            echo "Expected SemVer vMAJOR.MINOR.PATCH (v0.x allowed)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install aarch64 GNU toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Sync crate version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Only bump [package] version, not dependency versions.
+          sed -i '0,/^version = /s/^version = ".*"/version = "'"${version}"'"/' Cargo.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/santaizi-agent-rs" dist/santaizi-agent-rs
+          zip -j "dist/santaizi-agent-rs_${{ matrix.goos }}_${{ matrix.goarch }}.zip" dist/santaizi-agent-rs
+
+      # Private repos on GitHub Free share a ~500MB Actions artifact quota
+      # across the whole account. Stage binaries on a per-run draft release
+      # instead so publish jobs are not blocked by that quota.
+      - name: Upload binaries to temporary release
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if gh release view "$CI_TAG" >/dev/null 2>&1; then
+              break
+            fi
+            gh release create "$CI_TAG" \
+              --draft \
+              --target "${{ github.sha }}" \
+              --title "CI artifacts ${{ github.run_id }}" \
+              --notes "Temporary build outputs for ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Deleted after publish." \
+              && break || true
+            sleep 2
+          done
+          gh release view "$CI_TAG" >/dev/null
+          shopt -s nullglob
+          files=(dist/santaizi-agent-rs_${{ matrix.goos }}_${{ matrix.goarch }}*.zip)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no build outputs to upload" >&2
+            exit 1
+          fi
+          gh release upload "$CI_TAG" "${files[@]}" --clobber
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Release
+    permissions:
+      contents: write
+    steps:
+      # gh infers the repo from git remotes. This job has no checkout, so
+      # GH_REPO is required; otherwise download fails with "not a git repository".
+      - name: Download binaries from temporary release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: |
+          mkdir -p bin
+          gh release download "$CI_TAG" --dir bin
+          ls -la bin/
+
+      - name: Checksum
+        run: sha256sum ./bin/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "checksums.txt,bin/*.zip"
+          generateReleaseNotes: true
+
+  cleanup:
+    name: Cleanup CI release
+    permissions:
+      contents: write
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary CI release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          CI_TAG: ci-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if gh release view "$CI_TAG" >/dev/null 2>&1; then
+            gh release delete "$CI_TAG" --yes
+          else
+            echo "no temporary release $CI_TAG to delete"
+          fi
+          # Drafts may be untagged; ignore a missing git ref.
+          gh api -X DELETE "repos/${GH_REPO}/git/refs/tags/${CI_TAG}" >/dev/null 2>&1 || true
