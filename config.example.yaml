@@ -5,11 +5,11 @@ client_secret: ""
 # 上报通路：v2（默认，Control+Ingest 流，对齐 Go 探针）或 v1（unary 回退）
 protocol: "v2"
 
-# gRPC TLS（面板 grpc_tls.enabled 时打开）
+# gRPC TLS（面板 grpc_tls.enabled 时打开）。true 时启动会 Enroll 设备证到 telemetry.data_dir/pki/
 tls: false
 # 自签 CA 证书路径（PEM）
 # tls_ca_file: ""
-# MVP 暂不支持跳过证书校验
+# 暂不支持跳过证书校验
 # insecure_tls: false
 
 # State 上报间隔秒数（1-3600，仅 v1 通路）

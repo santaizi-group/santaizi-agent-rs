@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Request, service::interceptor::InterceptedService};
 use tracing::{info, warn};
 
@@ -24,17 +24,45 @@ pub fn secret_interceptor(
     })
 }
 
+pub fn tls_server_name(server: &str) -> String {
+    if let Some(rest) = server.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest).to_string();
+    }
+    match server.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => server.to_string(),
+    }
+}
+
 pub fn build_channel(cfg: &Config) -> Result<Channel> {
+    build_channel_with_identity(cfg, None, false)
+}
+
+/// `streaming=true` 时不加整段 RPC timeout，避免 Control/Ingest 长连接被 10s 掐断。
+pub fn build_channel_with_identity(
+    cfg: &Config,
+    identity: Option<&Identity>,
+    streaming: bool,
+) -> Result<Channel> {
     let scheme = if cfg.tls { "https" } else { "http" };
     let mut endpoint = Endpoint::from_shared(format!("{scheme}://{}", cfg.server))
         .context("server 地址无效，应为 host:port")?
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(RPC_TIMEOUT);
+        .connect_timeout(Duration::from_secs(5));
+    if !streaming {
+        endpoint = endpoint.timeout(RPC_TIMEOUT);
+    }
     if cfg.tls {
-        let mut tls = ClientTlsConfig::new().with_webpki_roots();
+        let mut tls = ClientTlsConfig::new()
+            .domain_name(tls_server_name(&cfg.server))
+            .with_webpki_roots();
         if !cfg.tls_ca_file.is_empty() {
             let pem = std::fs::read(&cfg.tls_ca_file).context("读取 tls_ca_file 失败")?;
             tls = tls.ca_certificate(Certificate::from_pem(pem));
+        }
+        if let Some(identity) = identity {
+            tls = tls.identity(identity.clone());
         }
         endpoint = endpoint.tls_config(tls).context("TLS 配置失败")?;
     }
@@ -113,4 +141,16 @@ pub async fn run(cfg: Config, version: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tls_server_name;
+
+    #[test]
+    fn tls_server_name_strips_port() {
+        assert_eq!(tls_server_name("main.i18.in:18181"), "main.i18.in");
+        assert_eq!(tls_server_name("[::1]:5555"), "::1");
+        assert_eq!(tls_server_name("localhost"), "localhost");
+    }
 }

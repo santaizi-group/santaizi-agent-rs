@@ -54,7 +54,7 @@ cp ../santaizi-agent/proto/santaizi.proto proto/santaizi.proto
 
 - **v2 通路（默认）**：Control（hello → 凭证/endpoint 指派，15s AgentRuntime，24h 刷新凭证）+ Ingest（hello → 1s 批量上送 → ack）。事件对齐 Go 探针：启动/退出 LIFECYCLE、HOST（10m + IP 变化）、STATE（5s）、HEARTBEAT（10s）；`event_id` = SHA256(node‖session‖seq) 前 16 字节。
 - **v1 回退**（`--protocol v1`）：unary `ReportSystemInfo` + 周期 `ReportSystemState`。
-- 认证：metadata `client_secret`。
+- 认证：metadata `client_secret`；`tls: true` 时启动会 Enroll 设备证（`<data_dir>/pki/{client.key,client.crt,ca.crt}`），Control/Ingest 走 mTLS。仅当面板返回 `Unimplemented` 才回退密钥。提前 7 天 Renew。
 - 可靠性：内存队列保留至 ack（上限 4096，满丢最旧），断流 10s 重连；**无 WAL**，重启丢未确认事件。
 - 身份：16 字节 node UUID 持久化 `<data_dir>/identity`（0600），每进程新 session。
 - 采集：CPU / 内存 / swap / 磁盘 / 网卡 / load / 进程 / Linux sockstat 连接数 / uptime。
@@ -68,7 +68,6 @@ cp ../santaizi-agent/proto/santaizi.proto proto/santaizi.proto
 | WAL 可靠重放 | 内存队列；断网超上限或重启会丢事件 |
 | 服务探测 | HTTP / ICMP / TCP；收到 ProbeRequest 回「不支持」 |
 | NAT 穿透 | 收到 NATOpenRequest 回拒绝 |
-| Enrollment | 面板 `require_agent_mtls=true` 时不可用 |
 | 多 endpoint | 只连 primary，不下行到从端 |
 | RealtimeSnapshot / Ping | 未实现 |
 | insecure_tls | rustls 不支持跳过校验，用 `tls_ca_file` |

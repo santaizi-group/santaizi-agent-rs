@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[command(
     name = "santaizi-agent-rs",
     version,
-    about = "三太子监控 Rust 探针（MVP，v1 unary 通路）"
+    about = "三太子监控 Rust 探针（默认 v2 Control/Ingest）"
 )]
 struct Cli {
     /// 配置文件路径

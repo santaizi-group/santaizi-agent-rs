@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::monitor::Monitor;
 use crate::netip::{self, IpInfo};
 use crate::pb;
-use crate::report::{IP_FETCH_TIMEOUT, build_channel, secret_interceptor};
+use crate::report::{IP_FETCH_TIMEOUT, secret_interceptor};
 use anyhow::{Context, Result, bail};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,7 +214,7 @@ async fn control_loop(
 ) {
     loop {
         if let Err(e) = control_once(&cfg, channel.clone(), &shared, &host, &version).await {
-            warn!(error = %e, "control 流断开，{}s 后重连", RECONNECT_DELAY.as_secs());
+            warn!(error = %format!("{e:#}"), "control 流断开，{}s 后重连", RECONNECT_DELAY.as_secs());
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -233,11 +233,7 @@ async fn control_once(
             secret_interceptor(&cfg.client_secret)?,
         );
     let (tx, rx) = mpsc::channel::<pb::AgentControlRequest>(32);
-    let mut stream = client
-        .control(ReceiverStream::new(rx))
-        .await
-        .context("control 建流失败")?
-        .into_inner();
+    // grpc-go 在 Recv hello 之前不回响应头；hello 必须在 control().await 前入队。
     tx.send(pb::AgentControlRequest {
         body: Some(pb::agent_control_request::Body::Hello(
             pb::AgentControlHello {
@@ -251,7 +247,12 @@ async fn control_once(
         )),
     })
     .await
-    .context("control hello 发送失败")?;
+    .context("control hello 入队失败")?;
+    let mut stream = client
+        .control(ReceiverStream::new(rx))
+        .await
+        .context("control 建流失败")?
+        .into_inner();
     info!("control 流已建立");
 
     let mut runtime_tick = tokio::time::interval(RUNTIME_INTERVAL);
@@ -324,7 +325,7 @@ async fn control_once(
 async fn ingest_loop(cfg: Config, channel: Channel, shared: Arc<Shared>) {
     loop {
         if let Err(e) = ingest_once(&cfg, channel.clone(), &shared).await {
-            warn!(error = %e, "ingest 流断开，{}s 后重连", RECONNECT_DELAY.as_secs());
+            warn!(error = %format!("{e:#}"), "ingest 流断开，{}s 后重连", RECONNECT_DELAY.as_secs());
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -338,11 +339,6 @@ async fn ingest_once(cfg: &Config, channel: Channel, shared: &Arc<Shared>) -> Re
             secret_interceptor(&cfg.client_secret)?,
         );
     let (tx, rx) = mpsc::channel::<pb::TelemetryRequest>(64);
-    let mut stream = client
-        .ingest(ReceiverStream::new(rx))
-        .await
-        .context("ingest 建流失败")?
-        .into_inner();
     tx.send(pb::TelemetryRequest {
         body: Some(pb::telemetry_request::Body::Hello(pb::TelemetryHello {
             node_uuid: shared.node_uuid.to_vec(),
@@ -354,7 +350,12 @@ async fn ingest_once(cfg: &Config, channel: Channel, shared: &Arc<Shared>) -> Re
         })),
     })
     .await
-    .context("ingest hello 发送失败")?;
+    .context("ingest hello 入队失败")?;
+    let mut stream = client
+        .ingest(ReceiverStream::new(rx))
+        .await
+        .context("ingest 建流失败")?
+        .into_inner();
     info!(generation = endpoint.generation, "ingest 流已建立");
 
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -503,6 +504,7 @@ pub async fn run_with_shutdown<F: Future<Output = ()>>(
 ) -> Result<()> {
     let node_uuid = crate::identity::load_or_create(&cfg.telemetry.data_dir)?;
     let session_id = crate::identity::new_session_id();
+    let device = crate::pki::ensure_device_credentials(&cfg, node_uuid, version).await?;
     let shared = Arc::new(Shared::new(node_uuid, session_id));
 
     let mut monitor = Monitor::new();
@@ -526,7 +528,7 @@ pub async fn run_with_shutdown<F: Future<Output = ()>>(
     let host = monitor.host(&last_ip.ip, &country, version);
     let boot_time = monitor.boot_time();
 
-    let channel = build_channel(&cfg)?;
+    let channel = crate::report::build_channel_with_identity(&cfg, device.as_ref(), true)?;
     let control = tokio::spawn(control_loop(
         cfg.clone(),
         channel.clone(),
