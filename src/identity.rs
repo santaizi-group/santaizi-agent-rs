@@ -54,6 +54,18 @@ pub fn event_id(node: &[u8; 16], session: &[u8; 16], seq: u64) -> [u8; 16] {
     digest[..16].try_into().expect("sha256 输出 32 字节")
 }
 
+/// 压缩空洞 gap_id = SHA256(node ‖ session ‖ start ‖ end 大端) 前 16 字节。
+pub fn compacted_gap_id(node: &[u8; 16], session: &[u8; 16], start: u64, end: u64) -> [u8; 16] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(node);
+    h.update(session);
+    h.update(start.to_be_bytes());
+    h.update(end.to_be_bytes());
+    let digest = h.finalize();
+    digest[..16].try_into().expect("sha256 输出 32 字节")
+}
+
 pub fn validate_node_uuid(bytes: &[u8]) -> Result<()> {
     if bytes.len() != 16 {
         bail!("node_uuid 需为 16 字节");

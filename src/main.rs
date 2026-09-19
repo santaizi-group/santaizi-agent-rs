@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = concat!(env!("CARGO_PKG_VERSION"), "-rs");
     tracing::info!(version, server = %cfg.server, tls = cfg.tls, protocol = %cfg.protocol, "santaizi-agent-rs 启动");
     match cfg.protocol.as_str() {
         "v1" => santaizi_agent_rs::report::run(cfg, version).await,

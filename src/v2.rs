@@ -49,6 +49,7 @@ struct Inner {
     latest_seq: u64,
     latest_at: i64,
     queue_full_warned_at: Option<Instant>,
+    dropped: Option<(u64, u64)>,
 }
 
 pub struct Shared {
@@ -83,6 +84,7 @@ impl Shared {
                 latest_seq: 0,
                 latest_at: 0,
                 queue_full_warned_at: None,
+                dropped: None,
             }),
             ready: watch::channel(false).0,
             assignment_changed: watch::channel(0).0,
@@ -132,7 +134,12 @@ impl Shared {
         inner.latest_seq = sequence;
         inner.latest_at = now;
         if inner.queue.len() >= QUEUE_CAP {
-            inner.queue.pop_front();
+            if let Some(old) = inner.queue.pop_front() {
+                inner.dropped = Some(match inner.dropped {
+                    Some((start, end)) => (start, end.max(old.sequence)),
+                    None => (old.sequence, old.sequence),
+                });
+            }
             let now = Instant::now();
             if inner
                 .queue_full_warned_at
@@ -146,6 +153,9 @@ impl Shared {
     }
 
     fn peek_batch(&self, endpoint_id: &str, max: usize) -> Vec<pb::TelemetryRecord> {
+        if max == 0 {
+            return Vec::new();
+        }
         let inner = self.inner.lock().unwrap();
         let activation = inner
             .endpoints
@@ -153,15 +163,43 @@ impl Shared {
             .map(|e| e.activation_sequence.max(1))
             .unwrap_or(1);
         let ack = inner.acks.get(endpoint_id).copied().unwrap_or(0);
-        inner
-            .queue
-            .iter()
-            .filter(|e| e.sequence >= activation && e.sequence > ack)
-            .take(max)
-            .map(|e| pb::TelemetryRecord {
-                record: Some(pb::telemetry_record::Record::Event(e.clone())),
-            })
-            .collect()
+        let mut out = Vec::new();
+        if let Some((start, end)) = inner.dropped {
+            let start = start.max(ack.saturating_add(1)).max(activation);
+            if start <= end {
+                let created = now_nanos().max(1);
+                out.push(pb::TelemetryRecord {
+                    record: Some(pb::telemetry_record::Record::Gap(pb::SequenceGap {
+                        gap_id: crate::identity::compacted_gap_id(
+                            &self.node_uuid,
+                            &self.session_id,
+                            start,
+                            end,
+                        )
+                        .to_vec(),
+                        node_uuid: self.node_uuid.to_vec(),
+                        session_id: self.session_id.to_vec(),
+                        start_sequence: start,
+                        end_sequence: end,
+                        reason: pb::GapReason::Compacted as i32,
+                        created_at_unix_nano: created,
+                        ..Default::default()
+                    })),
+                });
+            }
+        }
+        let remain = max.saturating_sub(out.len());
+        out.extend(
+            inner
+                .queue
+                .iter()
+                .filter(|e| e.sequence >= activation && e.sequence > ack)
+                .take(remain)
+                .map(|e| pb::TelemetryRecord {
+                    record: Some(pb::telemetry_record::Record::Event(e.clone())),
+                }),
+        );
+        out
     }
 
     fn ack_through(&self, endpoint_id: &str, session_id: &[u8], through: u64) {
@@ -177,6 +215,19 @@ impl Shared {
             && through > sink.ack_through
         {
             sink.ack_through = through;
+        }
+        if let Some((_, end)) = inner.dropped {
+            let all_acked = if inner.endpoints.is_empty() {
+                through >= end
+            } else {
+                inner
+                    .endpoints
+                    .keys()
+                    .all(|id| inner.acks.get(id).copied().unwrap_or(0) >= end)
+            };
+            if all_acked {
+                inner.dropped = None;
+            }
         }
         gc_queue(&mut inner);
     }
@@ -1341,6 +1392,40 @@ mod tests {
         shared.ack_through("c1", &[2u8; 16], 3);
         assert!(shared.peek_batch("c1", 10).is_empty());
         assert_eq!(shared.peek_batch("primary", 10).len(), 1);
+    }
+
+    #[test]
+    fn overflow_emits_compacted_gap_until_acked() {
+        let shared = Shared::new([1u8; 16], [2u8; 16]);
+        for _ in 0..(QUEUE_CAP + 3) {
+            shared.append(
+                pb::TelemetryEventType::Heartbeat,
+                pb::TelemetryPriority::P0Critical,
+                pb::telemetry_event::Payload::Heartbeat(pb::HeartbeatPayload { boot_time_unix: 1 }),
+            );
+        }
+        let batch = shared.peek_batch("primary", 8);
+        let Some(pb::telemetry_record::Record::Gap(ref gap)) = batch[0].record else {
+            panic!("首条应为 SequenceGap");
+        };
+        assert_eq!(gap.start_sequence, 1);
+        assert_eq!(gap.end_sequence, 3);
+        assert_eq!(gap.reason, pb::GapReason::Compacted as i32);
+        assert_eq!(gap.gap_id.len(), 16);
+        assert!(gap.created_at_unix_nano > 0);
+        assert!(
+            batch
+                .iter()
+                .skip(1)
+                .all(|r| matches!(r.record, Some(pb::telemetry_record::Record::Event(_))))
+        );
+        shared.ack_through("primary", &[2u8; 16], 3);
+        let after = shared.peek_batch("primary", 8);
+        assert!(
+            after
+                .iter()
+                .all(|r| { !matches!(r.record, Some(pb::telemetry_record::Record::Gap(_))) })
+        );
     }
 
     fn test_cfg() -> Config {
