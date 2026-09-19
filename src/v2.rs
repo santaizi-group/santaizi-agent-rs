@@ -792,6 +792,8 @@ async fn sink_loop(
             shared.set_sink_error(&endpoint.endpoint_id, &format!("{e:#}"));
             warn!(
                 endpoint = %endpoint.endpoint_id,
+                address = %endpoint.address,
+                tls = endpoint.tls,
                 error = %format!("{e:#}"),
                 "ingest 流断开，{}s 后重连",
                 RECONNECT_DELAY.as_secs()
@@ -806,6 +808,79 @@ fn ping_unsupported(err: &tonic::Status) -> bool {
         err.code(),
         tonic::Code::Unimplemented | tonic::Code::InvalidArgument
     )
+}
+
+struct IngestSendState {
+    ping_disabled: bool,
+    last_snapshot_seq: u64,
+    last_ping_at: Instant,
+    ping_sent: Option<Instant>,
+    missed_pongs: u32,
+}
+
+/// 一条 outbound：有待确认事件就发 batch，否则快照，再否则按节拍 ping。
+/// `force_ping` 用于建流：grpc-go 要等第一次 Send 才回响应头，tonic 的 ingest().await
+/// 会卡在等头；hello 后再立刻塞 ping/batch，避免双方互等最后 broken pipe。
+async fn drive_ingest_send(
+    tx: &mpsc::Sender<pb::TelemetryRequest>,
+    cfg: &Config,
+    shared: &Shared,
+    endpoint: &pb::TelemetryEndpoint,
+    state: &mut IngestSendState,
+    force_ping: bool,
+) -> Result<()> {
+    let records = shared.peek_batch(&endpoint.endpoint_id, cfg.telemetry.batch_size);
+    if !records.is_empty() {
+        send_with_timeout(
+            tx,
+            pb::TelemetryRequest {
+                body: Some(pb::telemetry_request::Body::Batch(pb::TelemetryBatch {
+                    records,
+                })),
+            },
+            SEND_TIMEOUT,
+            "batch",
+        )
+        .await?;
+        return Ok(());
+    }
+    let seq = shared.latest_sequence();
+    if seq != 0
+        && seq != state.last_snapshot_seq
+        && let Some(snapshot) = shared.realtime_snapshot(capabilities(cfg))
+    {
+        send_with_timeout(
+            tx,
+            pb::TelemetryRequest {
+                body: Some(pb::telemetry_request::Body::RealtimeSnapshot(snapshot)),
+            },
+            SEND_TIMEOUT,
+            "snapshot",
+        )
+        .await?;
+        state.last_snapshot_seq = seq;
+        return Ok(());
+    }
+    if !state.ping_disabled && (force_ping || state.last_ping_at.elapsed() >= SINK_RTT_INTERVAL) {
+        if !force_ping && state.ping_sent.is_some() {
+            state.missed_pongs += 1;
+            if state.missed_pongs >= PING_MISS_LIMIT {
+                bail!("连续 {PING_MISS_LIMIT} 次 ping 未收到 pong，判定连接死亡");
+            }
+        }
+        state.last_ping_at = Instant::now();
+        state.ping_sent = Some(Instant::now());
+        send_with_timeout(
+            tx,
+            pb::TelemetryRequest {
+                body: Some(pb::telemetry_request::Body::Ping(pb::TelemetryPing {})),
+            },
+            SEND_TIMEOUT,
+            "ping",
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn ingest_once(
@@ -861,56 +936,40 @@ async fn ingest_once(
         "ingest hello",
     )
     .await?;
-    let mut stream = client
-        .ingest(ReceiverStream::new(rx))
-        .await
-        .context("ingest 建流失败")?
-        .into_inner();
+    let mut send = IngestSendState {
+        ping_disabled: *ping_disabled,
+        last_snapshot_seq: *last_snapshot_seq,
+        last_ping_at: Instant::now(),
+        ping_sent: None,
+        missed_pongs: 0,
+    };
+    drive_ingest_send(&tx, cfg, shared, endpoint, &mut send, true).await?;
+
+    let ingest_fut = client.ingest(ReceiverStream::new(rx));
+    tokio::pin!(ingest_fut);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut stream = loop {
+        tokio::select! {
+            result = &mut ingest_fut => {
+                break result.context("ingest 建流失败")?.into_inner();
+            }
+            _ = tick.tick() => {
+                drive_ingest_send(&tx, cfg, shared, endpoint, &mut send, false).await?;
+            }
+        }
+    };
     info!(
         endpoint = %endpoint.endpoint_id,
+        address = %endpoint.address,
         generation = endpoint.generation,
         "ingest 流已建立"
     );
     shared.set_sink_connected(&endpoint.endpoint_id, endpoint.generation, true);
 
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let mut last_ping_at = Instant::now();
-    let mut ping_sent: Option<Instant> = None;
-    let mut missed_pongs = 0u32;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let records = shared.peek_batch(&endpoint.endpoint_id, cfg.telemetry.batch_size);
-                if !records.is_empty() {
-                    send_with_timeout(&tx, pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::Batch(pb::TelemetryBatch { records })),
-                    }, SEND_TIMEOUT, "batch").await?;
-                    continue;
-                }
-                let seq = shared.latest_sequence();
-                if seq != 0
-                    && seq != *last_snapshot_seq
-                    && let Some(snapshot) = shared.realtime_snapshot(capabilities(cfg))
-                {
-                    send_with_timeout(&tx, pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::RealtimeSnapshot(snapshot)),
-                    }, SEND_TIMEOUT, "snapshot").await?;
-                    *last_snapshot_seq = seq;
-                }
-                // 发送节拍固定：pong 丢失不再加快 ping，连续丢失判连接死亡
-                if !*ping_disabled && last_ping_at.elapsed() >= SINK_RTT_INTERVAL {
-                    if ping_sent.is_some() {
-                        missed_pongs += 1;
-                        if missed_pongs >= PING_MISS_LIMIT {
-                            bail!("连续 {PING_MISS_LIMIT} 次 ping 未收到 pong，判定连接死亡");
-                        }
-                    }
-                    last_ping_at = Instant::now();
-                    ping_sent = Some(Instant::now());
-                    send_with_timeout(&tx, pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::Ping(pb::TelemetryPing {})),
-                    }, SEND_TIMEOUT, "ping").await?;
-                }
+                drive_ingest_send(&tx, cfg, shared, endpoint, &mut send, false).await?;
             }
             msg = stream.next() => {
                 match msg {
@@ -919,9 +978,9 @@ async fn ingest_once(
                             warn!(endpoint = %endpoint.endpoint_id, error = %resp.error, "面板 ingest 报错");
                         }
                         if resp.pong.is_some()
-                            && let Some(sent) = ping_sent.take()
+                            && let Some(sent) = send.ping_sent.take()
                         {
-                            missed_pongs = 0;
+                            send.missed_pongs = 0;
                             shared.set_sink_rtt(&endpoint.endpoint_id, endpoint.generation, sent.elapsed());
                         }
                         for ack in resp.acks {
@@ -929,14 +988,18 @@ async fn ingest_once(
                         }
                     }
                     Some(Err(e)) => {
-                        if ping_sent.take().is_some() && ping_unsupported(&e) {
-                            *ping_disabled = true;
+                        if send.ping_sent.take().is_some() && ping_unsupported(&e) {
+                            send.ping_disabled = true;
                             warn!(endpoint = %endpoint.endpoint_id, "面板不支持 TelemetryPing，已关闭");
                         }
+                        *ping_disabled = send.ping_disabled;
+                        *last_snapshot_seq = send.last_snapshot_seq;
                         shared.set_sink_connected(&endpoint.endpoint_id, endpoint.generation, false);
                         return Err(e.into());
                     }
                     None => {
+                        *ping_disabled = send.ping_disabled;
+                        *last_snapshot_seq = send.last_snapshot_seq;
                         shared.set_sink_connected(&endpoint.endpoint_id, endpoint.generation, false);
                         bail!("面板关闭了 ingest 流");
                     }

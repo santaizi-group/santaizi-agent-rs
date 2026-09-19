@@ -144,6 +144,8 @@ impl SantaiziControlService for MockControl {
 
 struct MockTelemetry {
     seen: Mock,
+    /// 对齐 grpc-go：Recv hello 后不立刻回 Response，直到再收到一条消息。
+    hold_headers_until_second: bool,
 }
 
 #[tonic::async_trait]
@@ -160,71 +162,36 @@ impl SantaiziTelemetryService for MockTelemetry {
         let mut inbound = request.into_inner();
         let seen = self.seen.clone();
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        if self.hold_headers_until_second {
+            let Some(Ok(first)) = inbound.message().await.transpose() else {
+                return Err(Status::invalid_argument("ingest hello required"));
+            };
+            record_ingest_hello(&seen, first);
+            let Some(Ok(second)) = inbound.message().await.transpose() else {
+                return Err(Status::aborted("held headers until second message"));
+            };
+            apply_ingest_message(&seen, &out_tx, second).await;
+            tokio::spawn(async move {
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(msg)) => apply_ingest_message(&seen, &out_tx, msg).await,
+                        _ => return,
+                    }
+                }
+            });
+            return Ok(Response::new(Box::pin(tokio_stream::StreamExt::map(
+                ReceiverStream::new(out_rx),
+                Ok,
+            ))));
+        }
         tokio::spawn(async move {
             let Some(Ok(first)) = inbound.message().await.transpose() else {
                 return;
             };
-            let Some(pb::telemetry_request::Body::Hello(hello)) = first.body else {
-                return;
-            };
-            *seen.telemetry_hello.lock().unwrap() = Some(hello.clone());
-            seen.telemetry_hellos.lock().unwrap().push(hello);
+            record_ingest_hello(&seen, first);
             loop {
                 match inbound.message().await {
-                    Ok(Some(pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::Ping(_)),
-                    })) => {
-                        *seen.pings.lock().unwrap() += 1;
-                        if out_tx
-                            .send(pb::TelemetryResponse {
-                                acks: vec![],
-                                accepted_gap_ids: vec![],
-                                error: String::new(),
-                                pong: Some(pb::TelemetryPong {}),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(Some(pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::RealtimeSnapshot(_)),
-                    })) => {
-                        *seen.snapshots.lock().unwrap() += 1;
-                    }
-                    Ok(Some(pb::TelemetryRequest {
-                        body: Some(pb::telemetry_request::Body::Batch(batch)),
-                    })) => {
-                        let mut max_seq = 0u64;
-                        let mut session = vec![];
-                        for record in &batch.records {
-                            if let Some(pb::telemetry_record::Record::Event(event)) = &record.record
-                            {
-                                max_seq = max_seq.max(event.sequence);
-                                session = event.session_id.clone();
-                                seen.events.lock().unwrap().push(event.clone());
-                            }
-                        }
-                        if max_seq > 0
-                            && out_tx
-                                .send(pb::TelemetryResponse {
-                                    acks: vec![pb::SessionAck {
-                                        node_uuid: vec![],
-                                        session_id: session,
-                                        ack_through: max_seq,
-                                    }],
-                                    accepted_gap_ids: vec![],
-                                    error: String::new(),
-                                    pong: None,
-                                })
-                                .await
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(Some(_)) => {}
+                    Ok(Some(msg)) => apply_ingest_message(&seen, &out_tx, msg).await,
                     _ => return,
                 }
             }
@@ -233,6 +200,63 @@ impl SantaiziTelemetryService for MockTelemetry {
             ReceiverStream::new(out_rx),
             Ok,
         ))))
+    }
+}
+
+fn record_ingest_hello(seen: &Mock, first: pb::TelemetryRequest) {
+    let Some(pb::telemetry_request::Body::Hello(hello)) = first.body else {
+        return;
+    };
+    *seen.telemetry_hello.lock().unwrap() = Some(hello.clone());
+    seen.telemetry_hellos.lock().unwrap().push(hello);
+}
+
+async fn apply_ingest_message(
+    seen: &Mock,
+    out_tx: &tokio::sync::mpsc::Sender<pb::TelemetryResponse>,
+    msg: pb::TelemetryRequest,
+) {
+    match msg.body {
+        Some(pb::telemetry_request::Body::Ping(_)) => {
+            *seen.pings.lock().unwrap() += 1;
+            let _ = out_tx
+                .send(pb::TelemetryResponse {
+                    acks: vec![],
+                    accepted_gap_ids: vec![],
+                    error: String::new(),
+                    pong: Some(pb::TelemetryPong {}),
+                })
+                .await;
+        }
+        Some(pb::telemetry_request::Body::RealtimeSnapshot(_)) => {
+            *seen.snapshots.lock().unwrap() += 1;
+        }
+        Some(pb::telemetry_request::Body::Batch(batch)) => {
+            let mut max_seq = 0u64;
+            let mut session = vec![];
+            for record in &batch.records {
+                if let Some(pb::telemetry_record::Record::Event(event)) = &record.record {
+                    max_seq = max_seq.max(event.sequence);
+                    session = event.session_id.clone();
+                    seen.events.lock().unwrap().push(event.clone());
+                }
+            }
+            if max_seq > 0 {
+                let _ = out_tx
+                    .send(pb::TelemetryResponse {
+                        acks: vec![pb::SessionAck {
+                            node_uuid: vec![],
+                            session_id: session,
+                            ack_through: max_seq,
+                        }],
+                        accepted_gap_ids: vec![],
+                        error: String::new(),
+                        pong: None,
+                    })
+                    .await;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -256,6 +280,7 @@ async fn v2_control_ingest_roundtrip() {
             }))
             .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
                 seen: seen.clone(),
+                hold_headers_until_second: false,
             }))
             .serve(addr),
     );
@@ -353,6 +378,66 @@ async fn v2_control_ingest_roundtrip() {
     assert!(*seen.runtimes.lock().unwrap() >= 1);
 }
 
+/// grpc-go Ingest 要等第一次 Send 才回响应头。hello 之后若客户端停送，双方互等。
+#[tokio::test]
+async fn v2_ingest_unblocks_when_server_holds_headers() {
+    let seen = Mock::default();
+    let addr = free_addr();
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(SantaiziControlServiceServer::new(MockControl {
+                seen: seen.clone(),
+                extra_endpoints: vec![],
+                probes: vec![],
+            }))
+            .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
+                seen: seen.clone(),
+                hold_headers_until_second: true,
+            }))
+            .serve(addr),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "santaizi-rs-test-{}-hold-headers",
+        std::process::id()
+    ));
+    let cfg = Config {
+        server: addr.to_string(),
+        client_secret: "test-secret".into(),
+        protocol: "v2".into(),
+        telemetry: TelemetryConfig {
+            data_dir: data_dir.to_string_lossy().into(),
+            state_interval: 1,
+            heartbeat_interval: 1,
+            host_interval: 3600,
+            batch_size: 256,
+            ..TelemetryConfig::default()
+        },
+        ip_report_period: 3600,
+        ..Config::default()
+    };
+    cfg.validate().unwrap();
+
+    v2::run_with_shutdown(cfg, "0.2.0-test", async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    assert!(
+        seen.telemetry_hello.lock().unwrap().is_some(),
+        "应收到 ingest hello"
+    );
+    let events = seen.events.lock().unwrap();
+    assert!(
+        !events.is_empty(),
+        "hold-headers 时仍应上送事件，否则 tonic 会卡在 ingest().await"
+    );
+}
+
 #[tokio::test]
 async fn v2_collector_ingest_and_tcp_probe() {
     use tokio::net::TcpListener;
@@ -396,6 +481,7 @@ async fn v2_collector_ingest_and_tcp_probe() {
             }))
             .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
                 seen: seen.clone(),
+                hold_headers_until_second: false,
             }))
             .serve(primary),
     );
@@ -403,6 +489,7 @@ async fn v2_collector_ingest_and_tcp_probe() {
         Server::builder()
             .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
                 seen: seen.clone(),
+                hold_headers_until_second: false,
             }))
             .serve(collector),
     );
@@ -505,6 +592,7 @@ async fn v2_probe_concurrency_limit() {
             }))
             .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
                 seen: seen.clone(),
+                hold_headers_until_second: false,
             }))
             .serve(addr),
     );
