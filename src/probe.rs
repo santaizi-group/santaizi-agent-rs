@@ -258,11 +258,11 @@ async fn icmp_probe(request: pb::IcmpProbeRequest, result: &mut pb::ProbeResult)
 #[cfg(unix)]
 fn icmp_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut words = data.chunks_exact(2);
-    for w in &mut words {
-        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    let (words, rem) = data.as_chunks::<2>();
+    for w in words {
+        sum += u32::from(u16::from_be_bytes(*w));
     }
-    if let Some(&tail) = words.remainder().first() {
+    if let Some(&tail) = rem.first() {
         sum += u32::from(tail) << 8;
     }
     while sum > 0xffff {
