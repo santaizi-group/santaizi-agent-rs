@@ -14,7 +14,6 @@ use tracing::{info, warn};
 const CLIENT_KEY: &str = "client.key";
 const CLIENT_CERT: &str = "client.crt";
 const CLIENT_CA: &str = "ca.crt";
-const RENEW_WINDOW_SECS: i64 = 7 * 24 * 3600;
 
 #[derive(Debug)]
 pub struct Bundle {
@@ -23,9 +22,24 @@ pub struct Bundle {
     pub ca_pem: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct DeviceCredentials {
+    pub identity: Identity,
+    pub ca_pem: Vec<u8>,
+}
+
 impl Bundle {
-    pub fn identity(&self) -> Identity {
-        Identity::from_pem(&self.cert_pem, &self.key_pem)
+    /// 解析失败必须上抛走重登记，不能让损坏 PEM 把进程打进崩溃循环。
+    pub fn identity(&self) -> Result<Identity> {
+        validate_pair(&self.key_pem, &self.cert_pem)?;
+        Ok(Identity::from_pem(&self.cert_pem, &self.key_pem))
+    }
+
+    pub fn credentials(&self) -> Result<DeviceCredentials> {
+        Ok(DeviceCredentials {
+            identity: self.identity()?,
+            ca_pem: self.ca_pem.clone(),
+        })
     }
 
     fn not_after_unix(&self) -> Result<i64> {
@@ -39,9 +53,12 @@ impl Bundle {
         }
     }
 
-    fn needs_renew(&self) -> bool {
+    /// `renew_days` 来自 `telemetry.cert_renew_days`；0 视为 7（对齐 Go ApplyDefaults）。
+    fn needs_renew(&self, renew_days: u32) -> bool {
+        let days = if renew_days == 0 { 7 } else { renew_days };
+        let window_secs = i64::from(days) * 24 * 3600;
         match self.not_after_unix() {
-            Ok(ts) => now_unix() >= ts.saturating_sub(RENEW_WINDOW_SECS),
+            Ok(ts) => now_unix() >= ts.saturating_sub(window_secs),
             Err(_) => true,
         }
     }
@@ -91,20 +108,48 @@ fn cert_not_after(pem: &[u8]) -> Result<i64> {
     Ok(cert.validity().not_after.timestamp())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+/// key/cert 配对校验：崩溃半截留下的不匹配 bundle 若直接使用会造成永久 TLS 失败。
+fn validate_pair(key_pem: &[u8], cert_pem: &[u8]) -> Result<()> {
+    let key_str = std::str::from_utf8(key_pem).context("私钥不是合法 UTF-8 PEM")?;
+    let key = KeyPair::from_pem(key_str).context("解析私钥 PEM 失败")?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem).context("解析证书 PEM 失败")?;
+    let (_, cert) =
+        x509_parser::parse_x509_certificate(&pem.contents).context("解析证书 DER 失败")?;
+    if cert.public_key().raw != key.public_key_der() {
+        bail!("证书与私钥不匹配");
+    }
+    Ok(())
+}
+
+/// 先写 `path.tmp`（创建即带目标权限，不留 umask 窗口），由调用方统一 rename。
+fn write_tmp(path: &Path, bytes: &[u8], mode: u32) -> Result<PathBuf> {
     let tmp = {
         let mut p = path.as_os_str().to_os_string();
         p.push(".tmp");
         PathBuf::from(p)
     };
-    std::fs::write(&tmp, bytes).with_context(|| format!("写入 {} 失败", tmp.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // 崩溃残留的 tmp 权限可能不对，先删再以目标权限重建
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("写入 {} 失败", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("写入 {} 失败", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("落盘 {} 失败", path.display()))?;
-    Ok(())
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, bytes).with_context(|| format!("写入 {} 失败", tmp.display()))?;
+    Ok(tmp)
+}
+
+fn rename_tmp(tmp: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(tmp, path).with_context(|| format!("落盘 {} 失败", path.display()))
 }
 
 pub fn save_bundle(data_dir: &str, bundle: &Bundle) -> Result<()> {
@@ -115,10 +160,19 @@ pub fn save_bundle(data_dir: &str, bundle: &Bundle) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    write_atomic(&dir.join(CLIENT_KEY), &bundle.key_pem, 0o600)?;
-    write_atomic(&dir.join(CLIENT_CERT), &bundle.cert_pem, 0o644)?;
-    if !bundle.ca_pem.is_empty() {
-        write_atomic(&dir.join(CLIENT_CA), &bundle.ca_pem, 0o644)?;
+    // key+cert 作为一个写入单元：全部 tmp 写好才逐个 rename；
+    // 中途崩溃只会留下完整旧 pair，残留 .tmp 由下次写入覆盖。
+    let key_tmp = write_tmp(&dir.join(CLIENT_KEY), &bundle.key_pem, 0o600)?;
+    let cert_tmp = write_tmp(&dir.join(CLIENT_CERT), &bundle.cert_pem, 0o644)?;
+    let ca_tmp = if bundle.ca_pem.is_empty() {
+        None
+    } else {
+        Some(write_tmp(&dir.join(CLIENT_CA), &bundle.ca_pem, 0o644)?)
+    };
+    rename_tmp(&key_tmp, &dir.join(CLIENT_KEY))?;
+    rename_tmp(&cert_tmp, &dir.join(CLIENT_CERT))?;
+    if let Some(tmp) = ca_tmp {
+        rename_tmp(&tmp, &dir.join(CLIENT_CA))?;
     }
     Ok(())
 }
@@ -130,11 +184,19 @@ pub fn load_bundle(data_dir: &str) -> Result<Option<Bundle>> {
     match (std::fs::read(&key_path), std::fs::read(&cert_path)) {
         (Ok(key_pem), Ok(cert_pem)) => {
             let ca_pem = std::fs::read(dir.join(CLIENT_CA)).unwrap_or_default();
-            Ok(Some(Bundle {
+            let bundle = Bundle {
                 key_pem,
                 cert_pem,
                 ca_pem,
-            }))
+            };
+            // 损坏/不配对的 bundle 视为无 bundle，走重登记
+            match validate_pair(&bundle.key_pem, &bundle.cert_pem) {
+                Ok(()) => Ok(Some(bundle)),
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "设备凭证 bundle 无效，将重新登记");
+                    Ok(None)
+                }
+            }
         }
         (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -189,7 +251,7 @@ async fn renew_once(
     current: &Bundle,
 ) -> Result<Bundle> {
     let (key_pem, csr_der) = generate_key_and_csr(&node_uuid)?;
-    let identity = current.identity();
+    let identity = current.identity()?;
     let channel = build_channel_with_identity(cfg, Some(&identity), false)?;
     let mut client =
         pb::santaizi_enrollment_service_client::SantaiziEnrollmentServiceClient::new(channel);
@@ -210,32 +272,32 @@ pub async fn ensure_device_credentials(
     cfg: &Config,
     node_uuid: [u8; 16],
     version: &str,
-) -> Result<Option<Identity>> {
+) -> Result<Option<DeviceCredentials>> {
     if !cfg.tls {
         return Ok(None);
     }
     if let Some(bundle) = load_bundle(&cfg.telemetry.data_dir)?
         && !bundle.expired()
     {
-        if bundle.needs_renew() {
+        if bundle.needs_renew(cfg.telemetry.cert_renew_days) {
             match renew_once(cfg, node_uuid, version, &bundle).await {
                 Ok(renewed) => {
                     save_bundle(&cfg.telemetry.data_dir, &renewed)?;
                     info!("设备证书已续期");
-                    return Ok(Some(renewed.identity()));
+                    return Ok(Some(renewed.credentials()?));
                 }
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "设备证书续期失败，继续使用现有证书");
                 }
             }
         }
-        return Ok(Some(bundle.identity()));
+        return Ok(Some(bundle.credentials()?));
     }
     match enroll_once(cfg, node_uuid, version).await {
         Ok(bundle) => {
             save_bundle(&cfg.telemetry.data_dir, &bundle)?;
             info!("已登记设备证书");
-            Ok(Some(bundle.identity()))
+            Ok(Some(bundle.credentials()?))
         }
         Err(e) if is_unimplemented(&e) => {
             warn!("面板不支持 Enrollment，回退到密钥认证");
@@ -280,22 +342,107 @@ mod tests {
         );
     }
 
+    /// 自签 bundle：仅用于落盘/配对校验测试。`not_after_year` 控制有效期。
+    fn self_signed_bundle(not_after_year: i32) -> Bundle {
+        let key_pair = KeyPair::generate_for(&PKCS_ED25519).expect("keygen");
+        let mut params = CertificateParams::new(vec!["test.local".to_string()]).expect("params");
+        params.not_after = rcgen::date_time_ymd(not_after_year, 1, 1);
+        let cert = params.self_signed(&key_pair).expect("self-signed");
+        Bundle {
+            key_pem: key_pair.serialize_pem().into_bytes(),
+            cert_pem: cert.pem().into_bytes(),
+            ca_pem: b"CA".to_vec(),
+        }
+    }
+
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("santaizi-pki-{tag}-{}", std::process::id()))
+    }
+
     #[test]
     fn save_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("santaizi-pki-{}", std::process::id()));
+        let dir = test_dir("roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = self_signed_bundle(2050);
+        let data_dir = dir.to_string_lossy().to_string();
+        save_bundle(&data_dir, &bundle).unwrap();
+        let loaded = load_bundle(&data_dir).unwrap().expect("loaded");
+        assert_eq!(loaded.key_pem, bundle.key_pem);
+        assert_eq!(loaded.cert_pem, bundle.cert_pem);
+        assert_eq!(loaded.ca_pem, b"CA");
+        // key 文件必须 0600（创建即带权限，无 umask 窗口）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("pki").join(CLIENT_KEY))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_mismatched_pair() {
+        let dir = test_dir("mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = self_signed_bundle(2050);
+        let b = self_signed_bundle(2050);
+        let mixed = Bundle {
+            key_pem: b.key_pem,
+            cert_pem: a.cert_pem,
+            ca_pem: a.ca_pem,
+        };
+        let data_dir = dir.to_string_lossy().to_string();
+        save_bundle(&data_dir, &mixed).unwrap();
+        assert!(
+            load_bundle(&data_dir).unwrap().is_none(),
+            "key/cert 不匹配的 bundle 必须视为无效，走重登记"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_corrupt_pem() {
+        let dir = test_dir("corrupt");
         let _ = std::fs::remove_dir_all(&dir);
         let bundle = Bundle {
             key_pem: b"KEY".to_vec(),
             cert_pem: b"CERT".to_vec(),
-            ca_pem: b"CA".to_vec(),
+            ca_pem: vec![],
         };
         let data_dir = dir.to_string_lossy().to_string();
         save_bundle(&data_dir, &bundle).unwrap();
-        let loaded = load_bundle(&data_dir).unwrap().expect("loaded");
-        assert_eq!(loaded.key_pem, b"KEY");
-        assert_eq!(loaded.cert_pem, b"CERT");
-        assert_eq!(loaded.ca_pem, b"CA");
+        assert!(
+            load_bundle(&data_dir).unwrap().is_none(),
+            "损坏 PEM 必须视为无效 bundle 而不是 panic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_errs_on_corrupt_pem() {
+        let bundle = Bundle {
+            key_pem: b"garbage".to_vec(),
+            cert_pem: b"garbage".to_vec(),
+            ca_pem: vec![],
+        };
+        assert!(bundle.identity().is_err());
+    }
+
+    #[test]
+    fn expired_bundle_detected() {
+        let bundle = self_signed_bundle(2020);
+        assert!(bundle.expired());
+        assert!(bundle.needs_renew(7));
+        let fresh = self_signed_bundle(2050);
+        assert!(!fresh.expired());
+        assert!(!fresh.needs_renew(7));
+        // 续期窗口可配置：窗口大于有效期时必须判定为待续期
+        assert!(fresh.needs_renew(9000));
+        // 0 回落默认 7 天（对齐 Go ApplyDefaults）
+        assert!(!fresh.needs_renew(0));
     }
 
     struct MockEnroll {

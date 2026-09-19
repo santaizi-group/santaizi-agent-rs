@@ -84,7 +84,7 @@ async fn v1_unary_roundtrip() {
     let mut monitor = Monitor::new();
     let mut last_ip = IpInfo::default();
     report::report_host(&mut client, &cfg, &mut monitor, &mut last_ip, "0.1.0-test").await;
-    let state = monitor.collect_state();
+    let state = monitor.collect_state(&cfg.capabilities);
     client.report_system_state(state).await.unwrap();
     server.abort();
 

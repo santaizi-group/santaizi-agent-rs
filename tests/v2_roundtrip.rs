@@ -22,8 +22,12 @@ struct Seen {
     control_hello: Mutex<Option<pb::AgentControlHello>>,
     telemetry_secret: Mutex<Option<String>>,
     telemetry_hello: Mutex<Option<pb::TelemetryHello>>,
+    telemetry_hellos: Mutex<Vec<pb::TelemetryHello>>,
     events: Mutex<Vec<pb::TelemetryEvent>>,
     runtimes: Mutex<u32>,
+    probe_results: Mutex<Vec<pb::ProbeResult>>,
+    pings: Mutex<u32>,
+    snapshots: Mutex<u32>,
 }
 
 type Mock = Arc<Seen>;
@@ -37,6 +41,8 @@ fn metadata_secret<T>(req: &Request<T>) -> Option<String> {
 
 struct MockControl {
     seen: Mock,
+    extra_endpoints: Vec<pb::TelemetryEndpoint>,
+    probes: Vec<pb::ProbeRequest>,
 }
 
 #[tonic::async_trait]
@@ -52,6 +58,8 @@ impl SantaiziControlService for MockControl {
         *self.seen.control_secret.lock().unwrap() = metadata_secret(&request);
         let mut inbound = request.into_inner();
         let seen = self.seen.clone();
+        let extra_endpoints = self.extra_endpoints.clone();
+        let probes = self.probes.clone();
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let Some(Ok(first)) = inbound.message().await.transpose() else {
@@ -76,19 +84,21 @@ impl SantaiziControlService for MockControl {
             {
                 return;
             }
+            let mut endpoints = vec![pb::TelemetryEndpoint {
+                endpoint_id: "primary".into(),
+                kind: pb::EndpointKind::Primary as i32,
+                address: String::new(),
+                reliable: true,
+                tls: false,
+                insecure_tls: false,
+                generation: 7,
+                activation_session_id: vec![],
+                activation_sequence: 0,
+            }];
+            endpoints.extend(extra_endpoints);
             let assignment = pb::EndpointAssignment {
                 config_version: 1,
-                endpoints: vec![pb::TelemetryEndpoint {
-                    endpoint_id: "primary".into(),
-                    kind: pb::EndpointKind::Primary as i32,
-                    address: String::new(),
-                    reliable: true,
-                    tls: false,
-                    insecure_tls: false,
-                    generation: 7,
-                    activation_session_id: vec![],
-                    activation_sequence: 0,
-                }],
+                endpoints,
             };
             if out_tx
                 .send(pb::PrimaryControlResponse {
@@ -99,13 +109,28 @@ impl SantaiziControlService for MockControl {
             {
                 return;
             }
+            for probe in probes {
+                if out_tx
+                    .send(pb::PrimaryControlResponse {
+                        body: Some(pb::primary_control_response::Body::ProbeRequest(probe)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             loop {
                 match inbound.message().await {
-                    Ok(Some(req)) => {
-                        if matches!(req.body, Some(pb::agent_control_request::Body::Runtime(_))) {
+                    Ok(Some(req)) => match req.body {
+                        Some(pb::agent_control_request::Body::Runtime(_)) => {
                             *seen.runtimes.lock().unwrap() += 1;
                         }
-                    }
+                        Some(pb::agent_control_request::Body::ProbeResult(result)) => {
+                            seen.probe_results.lock().unwrap().push(result);
+                        }
+                        _ => {}
+                    },
                     _ => return,
                 }
             }
@@ -142,9 +167,32 @@ impl SantaiziTelemetryService for MockTelemetry {
             let Some(pb::telemetry_request::Body::Hello(hello)) = first.body else {
                 return;
             };
-            *seen.telemetry_hello.lock().unwrap() = Some(hello);
+            *seen.telemetry_hello.lock().unwrap() = Some(hello.clone());
+            seen.telemetry_hellos.lock().unwrap().push(hello);
             loop {
                 match inbound.message().await {
+                    Ok(Some(pb::TelemetryRequest {
+                        body: Some(pb::telemetry_request::Body::Ping(_)),
+                    })) => {
+                        *seen.pings.lock().unwrap() += 1;
+                        if out_tx
+                            .send(pb::TelemetryResponse {
+                                acks: vec![],
+                                accepted_gap_ids: vec![],
+                                error: String::new(),
+                                pong: Some(pb::TelemetryPong {}),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(Some(pb::TelemetryRequest {
+                        body: Some(pb::telemetry_request::Body::RealtimeSnapshot(_)),
+                    })) => {
+                        *seen.snapshots.lock().unwrap() += 1;
+                    }
                     Ok(Some(pb::TelemetryRequest {
                         body: Some(pb::telemetry_request::Body::Batch(batch)),
                     })) => {
@@ -203,6 +251,8 @@ async fn v2_control_ingest_roundtrip() {
         Server::builder()
             .add_service(SantaiziControlServiceServer::new(MockControl {
                 seen: seen.clone(),
+                extra_endpoints: vec![],
+                probes: vec![],
             }))
             .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
                 seen: seen.clone(),
@@ -222,6 +272,7 @@ async fn v2_control_ingest_roundtrip() {
             heartbeat_interval: 1,
             host_interval: 3600,
             batch_size: 256,
+            ..TelemetryConfig::default()
         },
         ip_report_period: 3600,
         ..Config::default()
@@ -251,6 +302,15 @@ async fn v2_control_ingest_roundtrip() {
     assert_eq!(hello.session_id.len(), 16);
     assert_eq!(hello.agent_version, "0.2.0-test");
     assert!(hello.host.is_some());
+    let enabled = hello
+        .capabilities
+        .as_ref()
+        .map(|c| c.enabled.clone())
+        .unwrap_or_default();
+    assert!(enabled.contains(&(pb::AgentCapability::ProbeHttp as i32)));
+    assert!(enabled.contains(&(pb::AgentCapability::ProbeTcp as i32)));
+    assert!(enabled.contains(&(pb::AgentCapability::ProbeIcmp as i32)));
+    assert!(!enabled.contains(&(pb::AgentCapability::Nat as i32)));
 
     // Ingest：hello 走 primary、带上指派 generation 与凭证。
     assert_eq!(
@@ -291,4 +351,200 @@ async fn v2_control_ingest_roundtrip() {
     );
     // control 上至少收到一次 AgentRuntime。
     assert!(*seen.runtimes.lock().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn v2_collector_ingest_and_tcp_probe() {
+    use tokio::net::TcpListener;
+
+    let seen = Mock::default();
+    let primary = free_addr();
+    let collector = free_addr();
+    let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_addr = probe_listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let (s, _) = probe_listener.accept().await.unwrap();
+        drop(s);
+    });
+
+    let extra = vec![pb::TelemetryEndpoint {
+        endpoint_id: "c1".into(),
+        kind: pb::EndpointKind::Collector as i32,
+        address: collector.to_string(),
+        reliable: true,
+        tls: false,
+        insecure_tls: false,
+        generation: 4,
+        activation_session_id: vec![],
+        activation_sequence: 0,
+    }];
+    let probe = pb::ProbeRequest {
+        probe_id: "tcp-e2e".into(),
+        target: Some(pb::probe_request::Target::Tcp(pb::TcpProbeRequest {
+            host: "127.0.0.1".into(),
+            port: probe_addr.port() as u32,
+            timeout_ms: 3000,
+        })),
+    };
+
+    let primary_server = tokio::spawn(
+        Server::builder()
+            .add_service(SantaiziControlServiceServer::new(MockControl {
+                seen: seen.clone(),
+                extra_endpoints: extra,
+                probes: vec![probe],
+            }))
+            .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
+                seen: seen.clone(),
+            }))
+            .serve(primary),
+    );
+    let collector_server = tokio::spawn(
+        Server::builder()
+            .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
+                seen: seen.clone(),
+            }))
+            .serve(collector),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let data_dir =
+        std::env::temp_dir().join(format!("santaizi-rs-test-{}-multi", std::process::id()));
+    let cfg = Config {
+        server: primary.to_string(),
+        client_secret: "test-secret".into(),
+        protocol: "v2".into(),
+        telemetry: TelemetryConfig {
+            data_dir: data_dir.to_string_lossy().into(),
+            state_interval: 1,
+            heartbeat_interval: 1,
+            host_interval: 3600,
+            batch_size: 256,
+            ..TelemetryConfig::default()
+        },
+        ip_report_period: 3600,
+        ..Config::default()
+    };
+    cfg.validate().unwrap();
+
+    v2::run_with_shutdown(cfg, "0.2.0-test", async {
+        tokio::time::sleep(Duration::from_secs(7)).await;
+    })
+    .await
+    .unwrap();
+    primary_server.abort();
+    collector_server.abort();
+    let _ = accept.await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    let ids: std::collections::HashSet<_> = seen
+        .telemetry_hellos
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|h| h.endpoint_id.clone())
+        .collect();
+    assert!(ids.contains("primary"), "缺 primary ingest: {ids:?}");
+    assert!(ids.contains("c1"), "缺 collector ingest: {ids:?}");
+
+    let results = seen.probe_results.lock().unwrap();
+    assert_eq!(results.len(), 1, "应回一条探测结果");
+    assert!(
+        results[0].successful,
+        "tcp probe error={}",
+        results[0].error
+    );
+    assert_eq!(results[0].probe_id, "tcp-e2e");
+}
+
+/// 并发上限 32：慢目标占满许可后，超出的 probe 必须立即回失败结果而不是排队。
+#[tokio::test]
+async fn v2_probe_concurrency_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+    let http_server = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = http_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    const PROBE_COUNT: usize = 40;
+    let probes: Vec<pb::ProbeRequest> = (0..PROBE_COUNT)
+        .map(|i| pb::ProbeRequest {
+            probe_id: format!("http-{i}"),
+            target: Some(pb::probe_request::Target::Http(pb::HttpProbeRequest {
+                url: format!("http://127.0.0.1:{http_port}"),
+                timeout_ms: 8000,
+            })),
+        })
+        .collect();
+
+    let seen = Mock::default();
+    let addr = free_addr();
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(SantaiziControlServiceServer::new(MockControl {
+                seen: seen.clone(),
+                extra_endpoints: vec![],
+                probes,
+            }))
+            .add_service(SantaiziTelemetryServiceServer::new(MockTelemetry {
+                seen: seen.clone(),
+            }))
+            .serve(addr),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let data_dir =
+        std::env::temp_dir().join(format!("santaizi-rs-test-{}-probe", std::process::id()));
+    let cfg = Config {
+        server: addr.to_string(),
+        client_secret: "test-secret".into(),
+        protocol: "v2".into(),
+        telemetry: TelemetryConfig {
+            data_dir: data_dir.to_string_lossy().into(),
+            state_interval: 1,
+            heartbeat_interval: 1,
+            host_interval: 3600,
+            batch_size: 256,
+            ..TelemetryConfig::default()
+        },
+        ip_report_period: 3600,
+        ..Config::default()
+    };
+    cfg.validate().unwrap();
+
+    v2::run_with_shutdown(cfg, "0.2.0-test", async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    })
+    .await
+    .unwrap();
+    server.abort();
+    http_server.abort();
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    let results = seen.probe_results.lock().unwrap();
+    assert_eq!(results.len(), PROBE_COUNT, "每个 probe 都必须有结果");
+    let rejected = results
+        .iter()
+        .filter(|r| r.error.contains("concurrency limit"))
+        .count();
+    let ok = results.iter().filter(|r| r.successful).count();
+    assert_eq!(rejected, PROBE_COUNT - 32, "超过上限的必须立即拒绝");
+    assert_eq!(ok, 32, "上限内的必须执行成功");
 }

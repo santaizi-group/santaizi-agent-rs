@@ -38,7 +38,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // 分层：默认 < yaml < env < CLI（CLI 最高）。
     let mut cfg = config::Config::load(&cli.config)?;
+    cfg.apply_env()?;
     if let Some(v) = cli.server {
         cfg.server = v;
     }
@@ -54,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
         cfg.protocol = v;
     }
     cfg.debug = cfg.debug || cli.debug;
-    cfg.apply_env();
     cfg.validate()?;
 
     let filter = if cfg.debug { "debug" } else { "info" };

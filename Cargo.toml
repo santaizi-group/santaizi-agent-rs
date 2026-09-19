@@ -13,13 +13,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
 sysinfo = "0.39.6"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+socket2 = "0.6"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-ureq = "3.4.0"
 x509-parser = "0.16"
 
 [build-dependencies]

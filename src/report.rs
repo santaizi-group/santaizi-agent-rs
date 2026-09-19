@@ -46,25 +46,58 @@ pub fn build_channel_with_identity(
     identity: Option<&Identity>,
     streaming: bool,
 ) -> Result<Channel> {
-    let scheme = if cfg.tls { "https" } else { "http" };
-    let mut endpoint = Endpoint::from_shared(format!("{scheme}://{}", cfg.server))
+    build_endpoint_channel(
+        &cfg.server,
+        cfg.tls,
+        &cfg.tls_ca_file,
+        &[],
+        identity,
+        streaming,
+    )
+}
+
+/// 按单个 endpoint 建连。`insecure_tls` 由调用方忽略（rustls 不能跳过校验）。
+pub fn build_endpoint_channel(
+    server: &str,
+    tls: bool,
+    tls_ca_file: &str,
+    extra_ca_pem: &[u8],
+    identity: Option<&Identity>,
+    streaming: bool,
+) -> Result<Channel> {
+    let scheme = if tls { "https" } else { "http" };
+    let mut endpoint = Endpoint::from_shared(format!("{scheme}://{server}"))
         .context("server 地址无效，应为 host:port")?
-        .connect_timeout(Duration::from_secs(5));
+        .connect_timeout(Duration::from_secs(5))
+        // 半开 TCP 检测：h2 keepalive ping + TCP keepalive 双保险
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)));
     if !streaming {
         endpoint = endpoint.timeout(RPC_TIMEOUT);
     }
-    if cfg.tls {
-        let mut tls = ClientTlsConfig::new()
-            .domain_name(tls_server_name(&cfg.server))
+    if tls {
+        let mut tls_cfg = ClientTlsConfig::new()
+            .domain_name(tls_server_name(server))
             .with_webpki_roots();
-        if !cfg.tls_ca_file.is_empty() {
-            let pem = std::fs::read(&cfg.tls_ca_file).context("读取 tls_ca_file 失败")?;
-            tls = tls.ca_certificate(Certificate::from_pem(pem));
+        let mut pem = Vec::new();
+        if !tls_ca_file.is_empty() {
+            pem.extend(std::fs::read(tls_ca_file).context("读取 tls_ca_file 失败")?);
+        }
+        if !extra_ca_pem.is_empty() {
+            if !pem.is_empty() {
+                pem.push(b'\n');
+            }
+            pem.extend_from_slice(extra_ca_pem);
+        }
+        if !pem.is_empty() {
+            tls_cfg = tls_cfg.ca_certificate(Certificate::from_pem(pem));
         }
         if let Some(identity) = identity {
-            tls = tls.identity(identity.clone());
+            tls_cfg = tls_cfg.identity(identity.clone());
         }
-        endpoint = endpoint.tls_config(tls).context("TLS 配置失败")?;
+        endpoint = endpoint.tls_config(tls_cfg).context("TLS 配置失败")?;
     }
     Ok(endpoint.connect_lazy())
 }
@@ -96,7 +129,7 @@ pub async fn report_host<I: Interceptor>(
     } else {
         cfg.country_code.clone()
     };
-    let host = monitor.host(&last.ip, &country, version);
+    let host = monitor.host(&last.ip, &country, version, &cfg.capabilities);
     match client.report_system_info(host).await {
         Ok(resp) => info!(proced = resp.get_ref().proced, "Host 已上报"),
         Err(e) => warn!(error = %e, "Host 上报失败"),
@@ -123,7 +156,7 @@ pub async fn run(cfg: Config, version: &str) -> Result<()> {
     loop {
         tokio::select! {
             _ = state_tick.tick() => {
-                let state = monitor.collect_state();
+                let state = monitor.collect_state(&cfg.capabilities);
                 if let Err(e) = client.report_system_state(state).await {
                     // Channel 内部懒重连，下个周期自动恢复。
                     warn!(error = %e, "State 上报失败，下个周期重试");

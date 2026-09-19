@@ -3,6 +3,7 @@ pub mod identity;
 pub mod monitor;
 pub mod netip;
 pub mod pki;
+pub mod probe;
 pub mod report;
 pub mod v2;
 

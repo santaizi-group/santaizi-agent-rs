@@ -16,12 +16,22 @@ pub fn load_or_create(data_dir: &str) -> Result<[u8; 16]> {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("创建数据目录 {} 失败", dir.display()))?;
             let id: [u8; 16] = rand::random();
-            std::fs::write(&path, id).with_context(|| format!("写入 {} 失败", path.display()))?;
+            // 创建即 0600：先写后 chmod 会留下 umask 默认权限窗口
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .with_context(|| format!("写入 {} 失败", path.display()))?;
+                f.write_all(&id)
+                    .with_context(|| format!("写入 {} 失败", path.display()))?;
             }
+            #[cfg(not(unix))]
+            std::fs::write(&path, id).with_context(|| format!("写入 {} 失败", path.display()))?;
             Ok(id)
         }
         Err(e) => Err(e).with_context(|| format!("读取 {} 失败", path.display())),
