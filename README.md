@@ -25,6 +25,12 @@ cargo build --release
 curl -fSL https://raw.githubusercontent.com/santaizi-group/santanzi-dashboard/main/script/install_agent_rs.sh | bash -s -- install_agent panel.example.com 5555 <secret> --clean-install --confirm-clean-install [--tls]
 ```
 
+本机升级（保留配置 / 身份；同一条命令会识别 Rust 并从本仓换包）：
+
+```bash
+curl -fSL https://raw.githubusercontent.com/santaizi-group/santanzi-dashboard/main/script/upgrade_agent.sh | bash
+```
+
 ## 配置
 
 键名与 Go 探针对齐的子集，见 [`config.example.yaml`](./config.example.yaml)。默认路径 `/etc/santaizi/agent.yaml`。
