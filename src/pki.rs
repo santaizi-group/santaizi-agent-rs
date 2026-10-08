@@ -2,14 +2,60 @@
 //! 面板 `grpc_tls.require_agent_mtls=true` 时 Control/Ingest 必须出示此证。
 
 use crate::config::Config;
+use crate::dialcache::{self, Store};
 use crate::pb;
-use crate::report::{build_channel_with_identity, secret_interceptor};
+use crate::report::{dial_target, secret_interceptor};
 use anyhow::{Context, Result, bail};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519, SanType};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tonic::transport::Identity;
 use tracing::{info, warn};
+
+/// 登记/续期失败后退避。从 1s 翻倍，封顶 10s；续期或登记成功清零。
+struct CredentialBackoff {
+    delay: Duration,
+    next_renew: Option<Instant>,
+}
+
+static CREDENTIAL_BACKOFF: Mutex<CredentialBackoff> = Mutex::new(CredentialBackoff {
+    delay: Duration::ZERO,
+    next_renew: None,
+});
+
+fn backoff_step(current: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        current.saturating_mul(2).min(Duration::from_secs(10))
+    }
+}
+
+/// 记录一次失败并返回本次应等待的时长。
+pub fn note_credential_failure() -> Duration {
+    let mut gate = CREDENTIAL_BACKOFF
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    gate.delay = backoff_step(gate.delay);
+    gate.next_renew = Some(Instant::now() + gate.delay);
+    gate.delay
+}
+
+pub fn clear_credential_backoff() {
+    let mut gate = CREDENTIAL_BACKOFF
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    gate.delay = Duration::ZERO;
+    gate.next_renew = None;
+}
+
+fn renew_due() -> bool {
+    let gate = CREDENTIAL_BACKOFF
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    gate.next_renew.is_none_or(|at| Instant::now() >= at)
+}
 
 const CLIENT_KEY: &str = "client.key";
 const CLIENT_CERT: &str = "client.crt";
@@ -224,24 +270,59 @@ fn bundle_from_response(key_pem: Vec<u8>, resp: pb::AgentEnrollResponse) -> Resu
     })
 }
 
+fn primary_targets(cfg: &Config) -> Result<(Store, Vec<dialcache::Target>)> {
+    let store = Store::open(&cfg.telemetry.data_dir)?;
+    let dns = cfg.dns.clone();
+    let targets = dialcache::plan(Some(&store), dialcache::PRIMARY_KEY, &cfg.server, |host| {
+        crate::dns::lookup_ips(&dns, host)
+    })?;
+    Ok((store, targets))
+}
+
+fn remember_primary(store: &Store, target: &dialcache::Target) {
+    if !target.from_dns {
+        return;
+    }
+    if let Err(err) = store.put(
+        dialcache::PRIMARY_KEY,
+        &target.host,
+        &target.port,
+        [target.ip.as_str()],
+    ) {
+        warn!(error = %err, "写入拨号缓存失败");
+    }
+}
+
 async fn enroll_once(cfg: &Config, node_uuid: [u8; 16], version: &str) -> Result<Bundle> {
     let (key_pem, csr_der) = generate_key_and_csr(&node_uuid)?;
-    let channel = build_channel_with_identity(cfg, None, false)?;
-    let mut client =
-        pb::santaizi_enrollment_service_client::SantaiziEnrollmentServiceClient::with_interceptor(
+    let (store, targets) = primary_targets(cfg)?;
+    let auth = secret_interceptor(&cfg.client_secret)?;
+    let mut last = None;
+    for target in &targets {
+        let channel = dial_target(cfg, target, &[], None, false)?;
+        let mut client = pb::santaizi_enrollment_service_client::SantaiziEnrollmentServiceClient::with_interceptor(
             channel,
-            secret_interceptor(&cfg.client_secret)?,
+            auth.clone(),
         );
-    let resp = client
-        .enroll(pb::AgentEnrollRequest {
-            node_uuid: node_uuid.to_vec(),
-            csr_der,
-            agent_version: version.to_string(),
-        })
-        .await
-        .context("Enroll RPC 失败")?
-        .into_inner();
-    bundle_from_response(key_pem, resp)
+        match client
+            .enroll(pb::AgentEnrollRequest {
+                node_uuid: node_uuid.to_vec(),
+                csr_der: csr_der.clone(),
+                agent_version: version.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                remember_primary(&store, target);
+                return bundle_from_response(key_pem, resp.into_inner());
+            }
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last
+        .map(|err| err.into())
+        .unwrap_or_else(|| anyhow::anyhow!("no dial target")))
+    .context("Enroll RPC 失败")
 }
 
 async fn renew_once(
@@ -252,19 +333,31 @@ async fn renew_once(
 ) -> Result<Bundle> {
     let (key_pem, csr_der) = generate_key_and_csr(&node_uuid)?;
     let identity = current.identity()?;
-    let channel = build_channel_with_identity(cfg, Some(&identity), false)?;
-    let mut client =
-        pb::santaizi_enrollment_service_client::SantaiziEnrollmentServiceClient::new(channel);
-    let resp = client
-        .renew(pb::AgentRenewRequest {
-            node_uuid: node_uuid.to_vec(),
-            csr_der,
-            agent_version: version.to_string(),
-        })
-        .await
-        .context("Renew RPC 失败")?
-        .into_inner();
-    bundle_from_response(key_pem, resp)
+    let (store, targets) = primary_targets(cfg)?;
+    let mut last = None;
+    for target in &targets {
+        let channel = dial_target(cfg, target, &[], Some(&identity), false)?;
+        let mut client =
+            pb::santaizi_enrollment_service_client::SantaiziEnrollmentServiceClient::new(channel);
+        match client
+            .renew(pb::AgentRenewRequest {
+                node_uuid: node_uuid.to_vec(),
+                csr_der: csr_der.clone(),
+                agent_version: version.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                remember_primary(&store, target);
+                return bundle_from_response(key_pem, resp.into_inner());
+            }
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last
+        .map(|err| err.into())
+        .unwrap_or_else(|| anyhow::anyhow!("no dial target")))
+    .context("Renew RPC 失败")
 }
 
 /// TLS 开启时登记/续期设备证。仅当面板返回 Unimplemented 才回退密钥认证。
@@ -279,15 +372,21 @@ pub async fn ensure_device_credentials(
     if let Some(bundle) = load_bundle(&cfg.telemetry.data_dir)?
         && !bundle.expired()
     {
-        if bundle.needs_renew(cfg.telemetry.cert_renew_days) {
+        if bundle.needs_renew(cfg.telemetry.cert_renew_days) && renew_due() {
             match renew_once(cfg, node_uuid, version, &bundle).await {
                 Ok(renewed) => {
+                    clear_credential_backoff();
                     save_bundle(&cfg.telemetry.data_dir, &renewed)?;
                     info!("设备证书已续期");
                     return Ok(Some(renewed.credentials()?));
                 }
                 Err(e) => {
-                    warn!(error = %format!("{e:#}"), "设备证书续期失败，继续使用现有证书");
+                    let delay = note_credential_failure();
+                    warn!(
+                        error = %format!("{e:#}"),
+                        delay_secs = delay.as_secs(),
+                        "设备证书续期失败，继续使用现有证书"
+                    );
                 }
             }
         }
@@ -295,6 +394,7 @@ pub async fn ensure_device_credentials(
     }
     match enroll_once(cfg, node_uuid, version).await {
         Ok(bundle) => {
+            clear_credential_backoff();
             save_bundle(&cfg.telemetry.data_dir, &bundle)?;
             info!("已登记设备证书");
             Ok(Some(bundle.credentials()?))

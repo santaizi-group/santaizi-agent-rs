@@ -1,9 +1,10 @@
-//! HTTP / ICMP / TCP 服务探测。对齐 Go `cmd/agent/probe.go` 的结果口径；
-//! 不做 uTLS、HTTP/3、Alt-Svc。
+//! HTTP / ICMP / TCP 服务探测。对齐 Go `cmd/agent/probe.go` 的结果口径。
+//! HTTP 使用 Chrome 系 ClientHello；`h3*` 的 Alt-Svc 走 HTTP/3。ICMP/TCP 不走自定义 DNS。
 
 use crate::config::CapabilityConfig;
 use crate::pb;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -14,6 +15,15 @@ const TCP_FALLBACK: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = "Mozilla/5.0 Santaizi-Agent";
 
 pub async fn execute(caps: &CapabilityConfig, request: pb::ProbeRequest) -> pb::ProbeResult {
+    execute_with_dns(caps, &[], request).await
+}
+
+/// `dns` 只用于 HTTP 探测（含 Alt-Svc）。空列表轮换内置公共 DNS。
+pub async fn execute_with_dns(
+    caps: &CapabilityConfig,
+    dns: &[String],
+    request: pb::ProbeRequest,
+) -> pb::ProbeResult {
     let mut result = pb::ProbeResult {
         probe_id: request.probe_id.clone(),
         ..Default::default()
@@ -29,7 +39,7 @@ pub async fn execute(caps: &CapabilityConfig, request: pb::ProbeRequest) -> pb::
             if !caps.http_probe {
                 result.error = "HTTP probe capability is disabled".into();
             } else {
-                http_probe(http, &mut result).await;
+                http_probe(http, dns, &mut result).await;
             }
         }
         Some(pb::probe_request::Target::Icmp(icmp)) => {
@@ -92,8 +102,8 @@ async fn lookup_ip(host_or_ip: &str) -> Result<IpAddr, String> {
         .ok_or_else(|| format!("cannot resolve {host_or_ip}"))
 }
 
-async fn http_probe(request: pb::HttpProbeRequest, result: &mut pb::ProbeResult) {
-    let parsed = match reqwest::Url::parse(&request.url) {
+async fn http_probe(request: pb::HttpProbeRequest, dns: &[String], result: &mut pb::ProbeResult) {
+    let parsed = match url::Url::parse(&request.url) {
         Ok(u) => u,
         Err(_) => {
             result.error = "HTTP probe requires an http or https URL".into();
@@ -105,45 +115,95 @@ async fn http_probe(request: pb::HttpProbeRequest, result: &mut pb::ProbeResult)
         return;
     }
     let timeout = bounded_timeout(request.timeout_ms, HTTP_FALLBACK);
-    let client = match reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_info(true)
-        .build()
-    {
+    let host = parsed.host_str().unwrap_or_default().to_string();
+    let Some(ip) = resolve_first(dns, &host).await else {
+        result.error = format!("cannot resolve {host}");
+        return;
+    };
+    let client = match http_client(timeout, &host, SocketAddr::new(ip, 0)) {
         Ok(c) => c,
         Err(e) => {
-            result.error = e.to_string();
+            result.error = e;
             return;
         }
     };
     let started = Instant::now();
-    let response = match client
-        .get(parsed.as_str())
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .header(
-            reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.8")
-        .send()
-        .await
-    {
+    let response = match send_probe(&client, parsed.as_str(), &host).await {
         Ok(r) => r,
         Err(e) => {
-            result.delay_ms = started.elapsed().as_secs_f64() * 1000.0;
-            result.error = e.to_string();
+            result.delay_ms = elapsed_ms(started);
+            result.error = e;
             return;
         }
     };
-    result.delay_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let status = response.status().as_u16() as u32;
+    result.delay_ms = elapsed_ms(started);
+    let alt = response
+        .headers()
+        .get(http::header::ALT_SVC)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    fill_http_result(&response, result);
+    if let Err(err) = response.bytes().await {
+        result.error = err.to_string();
+        return;
+    }
+    if !result.error.is_empty() {
+        return;
+    }
+    if let Some(alt) = alt.as_deref()
+        && let Err(err) = validate_alt_svc(dns, &parsed, alt, timeout).await
+    {
+        result.successful = false;
+        result.error = err;
+        return;
+    }
+    result.successful = true;
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn http_client(timeout: Duration, host: &str, addr: SocketAddr) -> Result<wreq::Client, String> {
+    wreq::Client::builder()
+        .emulation(wreq_util::Emulation::Chrome144)
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .tls_info(true)
+        .resolve(host.to_string(), addr)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn probe_headers(req: wreq::RequestBuilder, host: &str) -> wreq::RequestBuilder {
+    req.header(
+        http::header::ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    )
+    .header(http::header::ACCEPT_LANGUAGE, "en-US,en;q=0.8")
+    .header(http::header::USER_AGENT, USER_AGENT)
+    .header(http::header::HOST, host)
+}
+
+async fn send_probe(
+    client: &wreq::Client,
+    url: &str,
+    host: &str,
+) -> Result<wreq::Response, String> {
+    probe_headers(client.get(url), host)
+        .send()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn fill_http_result(response: &wreq::Response, result: &mut pb::ProbeResult) {
+    let status = response.status();
+    let code = status.as_u16() as u32;
     let mut detail = pb::HttpProbeResult {
-        status_code: status,
+        status_code: code,
         ..Default::default()
     };
-    if let Some(info) = response.extensions().get::<reqwest::tls::TlsInfo>()
+    if let Some(info) = response.extensions().get::<wreq::tls::TlsInfo>()
         && let Some(der) = info.peer_certificate()
         && let Ok((_, cert)) = x509_parser::parse_x509_certificate(der)
     {
@@ -156,17 +216,225 @@ async fn http_probe(request: pb::HttpProbeRequest, result: &mut pb::ProbeResult)
             });
         detail.tls_expires_at_unix = cert.validity().not_after.timestamp();
     }
-    let drain = response.bytes().await;
     result.detail = Some(pb::probe_result::Detail::Http(detail));
-    if let Err(e) = drain {
-        result.error = e.to_string();
-        return;
+    if !(200..400).contains(&status.as_u16()) {
+        result.error = status_text(status);
     }
-    if !(200..400).contains(&status) {
-        result.error = format!("{status}");
-        return;
+}
+
+fn status_text(status: http::StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(reason) => format!("{} {reason}", status.as_u16()),
+        None => status.as_u16().to_string(),
     }
-    result.successful = true;
+}
+
+async fn resolve_first(dns: &[String], host: &str) -> Option<IpAddr> {
+    let servers = dns.to_vec();
+    let host = host.to_string();
+    let looked = tokio::task::spawn_blocking(move || crate::dns::lookup_ips(&servers, &host)).await;
+    looked
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|ips| ips.into_iter().next())
+}
+
+struct AltService {
+    protocol: String,
+    host: String,
+    port: String,
+}
+
+fn parse_alt_svc(header: &str) -> Result<Vec<AltService>, String> {
+    let mut out = Vec::new();
+    for item in split_alt_items(header) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((protocol, rest)) = item.split_once('=') else {
+            return Err("alternative service: malformed Alt-Svc".into());
+        };
+        let rest = rest.trim();
+        if !rest.starts_with('"') {
+            return Err("alternative service: malformed Alt-Svc".into());
+        }
+        let Some(end) = rest[1..].find('"') else {
+            return Err("alternative service: malformed Alt-Svc".into());
+        };
+        let authority = &rest[1..1 + end];
+        let (host, port) = split_alt_authority(authority)?;
+        out.push(AltService {
+            protocol: protocol.trim().to_string(),
+            host,
+            port,
+        });
+    }
+    Ok(out)
+}
+
+fn split_alt_items(header: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (i, ch) in header.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&header[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&header[start..]);
+    out
+}
+
+fn split_alt_authority(authority: &str) -> Result<(String, String), String> {
+    if let Some(port) = authority.strip_prefix(':') {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("alternative service: malformed Alt-Svc".into());
+        }
+        return Ok((String::new(), port.to_string()));
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return Err("alternative service: malformed Alt-Svc".into());
+        };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("alternative service: malformed Alt-Svc".into());
+        }
+        return Ok((host.to_string(), port.to_string()));
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Err("alternative service: malformed Alt-Svc".into());
+    };
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("alternative service: malformed Alt-Svc".into());
+    }
+    Ok((host.to_string(), port.to_string()))
+}
+
+async fn validate_alt_svc(
+    dns: &[String],
+    original: &url::Url,
+    header: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let services = parse_alt_svc(header)?;
+    let original_host = original.host_str().unwrap_or_default();
+    let original_port = original.port_or_known_default().unwrap_or(80).to_string();
+    for service in services {
+        if service.port.is_empty()
+            || (service.host == original_host && service.port == original_port)
+        {
+            continue;
+        }
+        let host = if service.host.is_empty() {
+            original_host.to_string()
+        } else {
+            service.host.clone()
+        };
+        let url = format!("https://{host}:{}/", service.port);
+        if service.protocol.starts_with("h3") {
+            let port: u16 = service
+                .port
+                .parse()
+                .map_err(|_| "alternative service: bad port")?;
+            http3_check(dns, &host, port, original_host, timeout).await?;
+        } else {
+            let Some(ip) = resolve_first(dns, &host).await else {
+                return Err(format!("alternative service: cannot resolve {host}"));
+            };
+            let client = http_client(timeout, &host, SocketAddr::new(ip, 0))?;
+            let response = send_probe(&client, &url, original_host)
+                .await
+                .map_err(|e| format!("alternative service: {e}"))?;
+            let status = response.status();
+            let body = response.bytes().await.map_err(|e| e.to_string())?;
+            drop(body);
+            if !(200..400).contains(&status.as_u16()) {
+                return Err(status_text(status));
+            }
+        }
+        break;
+    }
+    Ok(())
+}
+
+async fn http3_check(
+    dns: &[String],
+    connect_host: &str,
+    port: u16,
+    authority: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let Some(ip) = resolve_first(dns, connect_host).await else {
+        return Err(format!(
+            "alternative service: cannot resolve {connect_host}"
+        ));
+    };
+    let addr = SocketAddr::new(ip, port);
+    let check = async {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let quic =
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| e.to_string())?;
+        let mut endpoint =
+            quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| e.to_string())?;
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+        let connecting = endpoint
+            .connect(addr, connect_host)
+            .map_err(|e| format!("alternative service: {e}"))?;
+        let conn = connecting
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?;
+        let drive =
+            tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("https://{authority}/"))
+            .body(())
+            .map_err(|e| e.to_string())?;
+        let mut stream = send
+            .send_request(request)
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?;
+        while stream
+            .recv_data()
+            .await
+            .map_err(|e| format!("alternative service: {e}"))?
+            .is_some()
+        {}
+        drive.abort();
+        let status = response.status();
+        if !(200..400).contains(&status.as_u16()) {
+            return Err(status_text(status));
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(timeout, check).await {
+        Ok(result) => result,
+        Err(_) => Err("alternative service: HTTP/3 timed out".into()),
+    }
 }
 
 async fn tcp_probe(request: pb::TcpProbeRequest, result: &mut pb::ProbeResult) {
@@ -430,6 +698,19 @@ mod tests {
             bounded_timeout(5_000, HTTP_FALLBACK),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn alt_svc_skips_same_endpoint_and_keeps_first_other() {
+        let same = parse_alt_svc(r#"h2=":443""#).unwrap();
+        assert_eq!(same.len(), 1);
+        assert!(same[0].host.is_empty());
+        assert_eq!(same[0].port, "443");
+        let mixed = parse_alt_svc(r#"h3=":443", h2="alt.example:8443""#).unwrap();
+        assert_eq!(mixed[0].protocol, "h3");
+        assert_eq!(mixed[1].host, "alt.example");
+        assert_eq!(mixed[1].port, "8443");
+        assert!(parse_alt_svc("not-a-header").is_err());
     }
 
     #[tokio::test]

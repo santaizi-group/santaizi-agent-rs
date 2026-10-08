@@ -1,6 +1,6 @@
-# 三太子 Rust 探针配置（Go 探针键名对齐的子集）
-# 标量键可被 SANTAIZI_* 环境变量覆盖（如 SANTAIZI_SERVER），CLI 参数优先级最高；
-# Go 全量配置里本实现不读的键（dns、ip_report_interface、telemetry.wal 等）静默忽略。
+# 三太子 Rust 探针配置。键名与 Go 探针相同，可直接共用一份 yaml。
+# 标量键可被 SANTAIZI_* 环境变量覆盖（如 SANTAIZI_SERVER），CLI 参数优先级最高。
+# 间隔接受裸秒数或 Go duration（5s、10m）。未知键静默跳过。
 server: "localhost:5555"
 client_secret: ""
 
@@ -11,13 +11,17 @@ protocol: "v2"
 tls: false
 # 自签 CA 证书路径（PEM）
 # tls_ca_file: ""
-# 暂不支持跳过证书校验
+# 跳过证书校验（仅测试）
 # insecure_tls: false
 
 # State 上报间隔秒数（1-3600，仅 v1 通路）
 report_delay: 5
-# IP/归属地自查周期秒数（<60 拒绝启动；双栈均失败时固定 60 秒快重试）
+# IP/归属地自查周期秒数（0 视为 1800；双栈均失败且周期大于 60 秒时 1 分钟快重试）
 ip_report_period: 1800
+# 公网 IP 自查与流量统计绑定的网卡
+# ip_report_interface: "eth0"
+# 自定义 DNS（host:port）。空则轮换内置公共 DNS
+# dns: ["1.1.1.1:53"]
 # 固定国家码（可选，覆盖自查）
 # country_code: ""
 # 归属地国家码取 IPv6 自查结果（默认 false 取 IPv4）
@@ -27,11 +31,13 @@ ip_report_period: 1800
 # 只统计列表内磁盘分区（精确匹配挂载点；非空时取代内置文件系统白名单）
 # hard_drive_partition_allowlist: ["/"]
 
-# 能力开关（缺省与 Go 对齐；GPU / NAT 本实现不上报）
+# 能力开关（缺省与 Go 对齐，含 NAT）
 # capabilities:
 #   http_probe: true
 #   icmp_probe: true
 #   tcp_probe: true
+#   nat: true
+#   gpu: false
 #   temperature: false
 
 # v2 通路
@@ -41,6 +47,10 @@ telemetry:
   heartbeat_interval: 10
   host_interval: 600
   batch_size: 256
+  # wal 缺省与 Go 相同：段 8MiB、上限 256MiB、保留 1MiB、1s 或 64 条 fsync
+  # wal:
+  #   segment_size_bytes: 8388608
+  #   fsync_interval: 1s
   # 设备证到期前多少天触发续期（0 视为 7）
   # cert_renew_days: 7
   # 按 endpoint id 覆盖从端地址（不能私自加未分配观测点）

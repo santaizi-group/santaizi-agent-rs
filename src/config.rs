@@ -1,12 +1,14 @@
-//! 与 Go 探针对齐的配置键子集（santaizi-agent/model/model.go）。
+//! 与 Go 探针共用的配置键（santaizi-agent/model/model.go）。
 //!
-//! 有意不加 `deny_unknown_fields`：Rust 探针是 Go 配置的子集，必须能直接读
-//! Go 全量 yaml，静默跳过本实现不消费的键（`dns`、`ip_report_interface`、
-//! `telemetry.wal` 等），否则两实现无法共用同一份配置。
+//! 有意不加 `deny_unknown_fields`：未知键静默跳过，避免以后 Go 加键时这边起不来。
+//! 间隔同时接受裸秒数和 Go 的 duration 字符串（`5s`、`10m`）。
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
+use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -20,10 +22,14 @@ pub struct Config {
     pub tls_ca_file: String,
     /// State 上报间隔秒数（沿用 Go 遗留键 report_delay）
     pub report_delay: u64,
-    /// IP / 归属地刷新周期秒数
+    /// IP / 归属地刷新周期秒数。0 视为默认 1800；小于 60 允许（对齐 Go）。
     pub ip_report_period: u64,
+    /// 公网 IP 自查与流量统计绑定的网卡名。非空时网卡统计只留这一张。
+    pub ip_report_interface: String,
     /// 固定国家码，非空时覆盖自查结果
     pub country_code: String,
+    /// 自定义 DNS（`host:port`）。空则拨号与 HTTP 探测轮换内置公共 DNS。
+    pub dns: Vec<String>,
     /// true 时归属地国家码取 IPv6 自查结果；false 取 IPv4（v6 缺席时仍回退 v4）
     pub use_ipv6_countrycode: bool,
     /// 非空时只统计列表内网卡（精确匹配接口名），并取代内置前缀排除。
@@ -64,7 +70,8 @@ where
     })
 }
 
-/// 能力开关。缺省与 Go `DefaultCapabilities` 对齐；GPU / NAT 本实现不上报。
+/// 能力开关。采集项缺省与 Go `DefaultCapabilities` 对齐。
+/// `nat` 默认开启；配置或 `--disable-nat` 可关。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CapabilityConfig {
     #[serde(default = "default_true")]
@@ -93,7 +100,7 @@ pub struct CapabilityConfig {
     pub icmp_probe: bool,
     #[serde(default = "default_true")]
     pub tcp_probe: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub nat: bool,
 }
 
@@ -117,7 +124,7 @@ impl Default for CapabilityConfig {
             http_probe: true,
             icmp_probe: true,
             tcp_probe: true,
-            nat: false,
+            nat: true,
         }
     }
 }
@@ -132,17 +139,17 @@ pub struct CollectorOverride {
     pub insecure_tls: bool,
 }
 
-/// v2 通路子配置，键对齐 Go 探针 telemetry.* 子集。
+/// v2 通路子配置，键对齐 Go 探针 telemetry.*。
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
-    /// 身份与后续 WAL 的数据目录
+    /// 身份、WAL、拨号缓存的数据目录
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    #[serde(default = "default_state_interval")]
+    #[serde(default = "default_state_interval", deserialize_with = "de_secs")]
     pub state_interval: u64,
-    #[serde(default = "default_heartbeat_interval")]
+    #[serde(default = "default_heartbeat_interval", deserialize_with = "de_secs")]
     pub heartbeat_interval: u64,
-    #[serde(default = "default_host_interval")]
+    #[serde(default = "default_host_interval", deserialize_with = "de_secs")]
     pub host_interval: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -153,6 +160,23 @@ pub struct TelemetryConfig {
     pub disabled_remote_ids: Vec<String>,
     #[serde(default)]
     pub collectors: Vec<CollectorOverride>,
+    #[serde(default)]
+    pub wal: WalConfig,
+}
+
+/// Segment WAL。默认与 Go `ApplyDefaults` 相同。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalConfig {
+    #[serde(default = "default_segment_size")]
+    pub segment_size_bytes: u64,
+    #[serde(default = "default_wal_max")]
+    pub max_size_bytes: u64,
+    #[serde(default = "default_wal_reserve")]
+    pub reserve_bytes: u64,
+    #[serde(default = "default_fsync_interval", deserialize_with = "de_duration")]
+    pub fsync_interval: Duration,
+    #[serde(default = "default_fsync_records")]
+    pub fsync_records: usize,
 }
 
 fn default_data_dir() -> String {
@@ -173,6 +197,131 @@ fn default_batch_size() -> usize {
 fn default_cert_renew_days() -> u32 {
     7
 }
+fn default_segment_size() -> u64 {
+    8 << 20
+}
+fn default_wal_max() -> u64 {
+    256 << 20
+}
+fn default_wal_reserve() -> u64 {
+    1 << 20
+}
+fn default_fsync_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_fsync_records() -> usize {
+    64
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            segment_size_bytes: default_segment_size(),
+            max_size_bytes: default_wal_max(),
+            reserve_bytes: default_wal_reserve(),
+            fsync_interval: default_fsync_interval(),
+            fsync_records: default_fsync_records(),
+        }
+    }
+}
+
+/// 裸秒数或 Go duration（`5s`、`10m`、`500ms`）解析成秒。不足 1 秒且非 0 时进位为 1。
+pub fn parse_secs(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    if let Ok(n) = trimmed.parse::<u64>() {
+        return Ok(n);
+    }
+    let d = parse_go_duration(trimmed)?;
+    Ok(duration_to_secs(d))
+}
+
+pub fn parse_go_duration(raw: &str) -> Result<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("duration 为空");
+    }
+    let mut total = Duration::ZERO;
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut saw = false;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i] == b'-' {
+            bail!("duration 不接受负数：{trimmed}");
+        }
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == start {
+            bail!("duration 无效：{trimmed}");
+        }
+        let num: f64 = trimmed[start..i]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("duration 数值无效：{trimmed}"))?;
+        if !num.is_finite() || num < 0.0 {
+            bail!("duration 数值无效：{trimmed}");
+        }
+        let unit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        if unit_start == i {
+            bail!("duration 缺少单位：{trimmed}");
+        }
+        let unit = &trimmed[unit_start..i];
+        let scale = match unit {
+            "ns" => 1e-9,
+            "us" | "µs" | "μs" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            _ => bail!("duration 单位无效：{unit}"),
+        };
+        total += Duration::from_secs_f64(num * scale);
+        saw = true;
+    }
+    if !saw {
+        bail!("duration 无效：{trimmed}");
+    }
+    Ok(total)
+}
+
+fn duration_to_secs(d: Duration) -> u64 {
+    let secs = d.as_secs();
+    if secs == 0 && !d.is_zero() { 1 } else { secs }
+}
+
+fn de_secs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    struct V;
+    impl Visitor<'_> for V {
+        type Value = u64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("秒数或 Go duration 字符串")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(E::custom)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<u64, E> {
+            if v < 0.0 || !v.is_finite() {
+                return Err(E::custom("秒数无效"));
+            }
+            Ok(v as u64)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            parse_secs(v).map_err(E::custom)
+        }
+    }
+    deserializer.deserialize_any(V)
+}
+
+fn de_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+    let secs = de_secs(deserializer)?;
+    Ok(Duration::from_secs(secs))
+}
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
@@ -185,6 +334,7 @@ impl Default for TelemetryConfig {
             cert_renew_days: default_cert_renew_days(),
             disabled_remote_ids: Vec::new(),
             collectors: Vec::new(),
+            wal: WalConfig::default(),
         }
     }
 }
@@ -199,7 +349,9 @@ impl Default for Config {
             tls_ca_file: String::new(),
             report_delay: 5,
             ip_report_period: 1800,
+            ip_report_interface: String::new(),
             country_code: String::new(),
+            dns: Vec::new(),
             use_ipv6_countrycode: false,
             nic_allowlist: Vec::new(),
             hard_drive_partition_allowlist: Vec::new(),
@@ -245,6 +397,13 @@ fn set_env_num<T: std::str::FromStr>(
     Ok(())
 }
 
+fn set_env_secs(get: &impl Fn(&str) -> Option<String>, key: &str, dst: &mut u64) -> Result<()> {
+    if let Some(v) = get(key) {
+        *dst = parse_secs(&v).map_err(|e| anyhow::anyhow!("环境变量 {key}：{e:#}"))?;
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
@@ -269,12 +428,24 @@ impl Config {
         set_env_bool(&get, "SANTAIZI_INSECURE_TLS", &mut self.insecure_tls)?;
         set_env_str(&get, "SANTAIZI_TLS_CA_FILE", &mut self.tls_ca_file);
         set_env_num(&get, "SANTAIZI_REPORT_DELAY", &mut self.report_delay)?;
-        set_env_num(
+        set_env_secs(
             &get,
             "SANTAIZI_IP_REPORT_PERIOD",
             &mut self.ip_report_period,
         )?;
+        set_env_str(
+            &get,
+            "SANTAIZI_IP_REPORT_INTERFACE",
+            &mut self.ip_report_interface,
+        );
         set_env_str(&get, "SANTAIZI_COUNTRY_CODE", &mut self.country_code);
+        if let Some(v) = get("SANTAIZI_DNS") {
+            self.dns = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         set_env_bool(
             &get,
             "SANTAIZI_USE_IPV6_COUNTRYCODE",
@@ -311,17 +482,17 @@ impl Config {
             "SANTAIZI_TELEMETRY_DATA_DIR",
             &mut self.telemetry.data_dir,
         );
-        set_env_num(
+        set_env_secs(
             &get,
             "SANTAIZI_TELEMETRY_STATE_INTERVAL",
             &mut self.telemetry.state_interval,
         )?;
-        set_env_num(
+        set_env_secs(
             &get,
             "SANTAIZI_TELEMETRY_HEARTBEAT_INTERVAL",
             &mut self.telemetry.heartbeat_interval,
         )?;
-        set_env_num(
+        set_env_secs(
             &get,
             "SANTAIZI_TELEMETRY_HOST_INTERVAL",
             &mut self.telemetry.host_interval,
@@ -336,7 +507,52 @@ impl Config {
             "SANTAIZI_TELEMETRY_CERT_RENEW_DAYS",
             &mut self.telemetry.cert_renew_days,
         )?;
+        set_env_num(
+            &get,
+            "SANTAIZI_TELEMETRY_WAL_SEGMENT_SIZE_BYTES",
+            &mut self.telemetry.wal.segment_size_bytes,
+        )?;
+        set_env_num(
+            &get,
+            "SANTAIZI_TELEMETRY_WAL_MAX_SIZE_BYTES",
+            &mut self.telemetry.wal.max_size_bytes,
+        )?;
+        set_env_num(
+            &get,
+            "SANTAIZI_TELEMETRY_WAL_RESERVE_BYTES",
+            &mut self.telemetry.wal.reserve_bytes,
+        )?;
+        set_env_num(
+            &get,
+            "SANTAIZI_TELEMETRY_WAL_FSYNC_RECORDS",
+            &mut self.telemetry.wal.fsync_records,
+        )?;
+        if let Some(v) = get("SANTAIZI_TELEMETRY_WAL_FSYNC_INTERVAL") {
+            self.telemetry.wal.fsync_interval = Duration::from_secs(parse_secs(&v)?);
+        }
         Ok(())
+    }
+
+    /// 对齐 Go `ApplyDefaults` 里「0 即默认」的项。CLI 覆盖之后调用。
+    pub fn normalize(&mut self) {
+        if self.ip_report_period == 0 {
+            self.ip_report_period = 1800;
+        }
+        if self.telemetry.wal.segment_size_bytes == 0 {
+            self.telemetry.wal.segment_size_bytes = default_segment_size();
+        }
+        if self.telemetry.wal.max_size_bytes == 0 {
+            self.telemetry.wal.max_size_bytes = default_wal_max();
+        }
+        if self.telemetry.wal.reserve_bytes == 0 {
+            self.telemetry.wal.reserve_bytes = default_wal_reserve();
+        }
+        if self.telemetry.wal.fsync_interval.is_zero() {
+            self.telemetry.wal.fsync_interval = default_fsync_interval();
+        }
+        if self.telemetry.wal.fsync_records == 0 {
+            self.telemetry.wal.fsync_records = default_fsync_records();
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -348,13 +564,6 @@ impl Config {
         }
         if !(1..=3600).contains(&self.report_delay) {
             bail!("report_delay 需在 1-3600 秒之间");
-        }
-        if self.ip_report_period < 60 {
-            bail!("ip_report_period 需 >= 60 秒");
-        }
-        if self.insecure_tls {
-            // tonic 0.14/rustls 不提供跳过证书校验；不是默认值错误，是能力边界。
-            bail!("暂不支持 insecure_tls；自签证书请用 tls_ca_file 指定 CA");
         }
         if self.protocol != "v1" && self.protocol != "v2" {
             bail!("protocol 只能是 v1 或 v2");
@@ -402,7 +611,7 @@ capabilities:
         assert!(cfg.capabilities.cpu);
         assert!(cfg.capabilities.temperature);
         assert!(!cfg.capabilities.gpu);
-        assert!(!cfg.capabilities.nat);
+        assert!(cfg.capabilities.nat);
     }
 
     #[test]
@@ -470,19 +679,37 @@ nic_allowlist:
 
     /// Go 全量 yaml 里本实现不读的键必须静默跳过（无 deny_unknown_fields）。
     #[test]
-    fn unknown_go_keys_are_tolerated() {
+    fn go_yaml_duration_dns_and_wal() {
         let cfg: Config = serde_yaml::from_str(
             r#"
 client_secret: "s"
-dns: ["1.1.1.1"]
+dns: ["1.1.1.1:53"]
 ip_report_interface: "eth0"
+insecure_tls: true
 telemetry:
+  state_interval: 5s
+  heartbeat_interval: 10s
+  host_interval: 10m
   wal:
     segment_size_bytes: 8388608
+    fsync_interval: 1s
+    fsync_records: 64
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.client_secret, "s");
+        assert_eq!(cfg.dns, ["1.1.1.1:53"]);
+        assert_eq!(cfg.ip_report_interface, "eth0");
+        assert!(cfg.insecure_tls);
+        assert_eq!(cfg.telemetry.state_interval, 5);
+        assert_eq!(cfg.telemetry.heartbeat_interval, 10);
+        assert_eq!(cfg.telemetry.host_interval, 600);
+        assert_eq!(cfg.telemetry.wal.segment_size_bytes, 8 << 20);
+        assert_eq!(
+            cfg.telemetry.wal.fsync_interval,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(cfg.telemetry.wal.fsync_records, 64);
+        assert!(cfg.validate().is_ok());
     }
 
     fn env_cfg(vars: &[(&str, &str)]) -> Config {
@@ -570,14 +797,15 @@ telemetry:
     }
 
     #[test]
-    fn validate_rejects_ip_report_period_below_60() {
+    fn short_ip_report_period_is_allowed() {
         let mut cfg = Config {
             client_secret: "s".into(),
             ..Config::default()
         };
-        cfg.ip_report_period = 59;
-        assert!(cfg.validate().is_err());
-        cfg.ip_report_period = 60;
+        cfg.ip_report_period = 30;
         assert!(cfg.validate().is_ok());
+        cfg.ip_report_period = 0;
+        cfg.normalize();
+        assert_eq!(cfg.ip_report_period, 1800);
     }
 }

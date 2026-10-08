@@ -1,25 +1,39 @@
 use crate::config::CapabilityConfig;
 use crate::pb;
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
 
-/// 与 Go 探针一致的内置网卡排除前缀（santaizi-agent/pkg/monitor）。
-const NIC_EXCLUDE_PREFIXES: &[&str] =
-    &["lo", "tun", "docker", "veth", "br-", "vmbr", "vnet", "kube"];
-/// 与 Go 探针一致的文件系统白名单。
+/// 与 Go `excludeNetInterfaces` 一致：名字里出现这些子串就排除。
+const NIC_EXCLUDE: &[&str] = &["lo", "tun", "docker", "veth", "br-", "vmbr", "vnet", "kube"];
+/// 与 Go `expectDiskFsTypes` 一致。
 const FS_ALLOWLIST: &[&str] = &[
-    "apfs", "ext2", "ext3", "ext4", "f2fs", "reiserfs", "jfs", "jfs2", "btrfs", "fuseblk", "zfs",
-    "simfs", "ntfs", "fat32", "exfat", "xfs", "hfs", "ufs",
+    "apfs",
+    "ext4",
+    "ext3",
+    "ext2",
+    "f2fs",
+    "reiserfs",
+    "jfs",
+    "btrfs",
+    "fuseblk",
+    "zfs",
+    "simfs",
+    "ntfs",
+    "fat32",
+    "exfat",
+    "xfs",
+    "fuse.rclone",
 ];
 const MOUNT_EXCLUDE_PREFIXES: &[&str] = &["/var/lib/kubelet"];
 
-/// Go TrackNetworkSpeed（monitor.go:297-305）：allowlist 非空时精确匹配接口名，
-/// 并取代内置前缀排除；为空时走内置排除。
+/// Go TrackNetworkSpeed：allowlist 非空时精确匹配并取代内置排除；为空时按子串排除。
 fn nic_included(name: &str, allowlist: &[String]) -> bool {
     if !allowlist.is_empty() {
         return allowlist.iter().any(|n| n == name);
     }
-    !NIC_EXCLUDE_PREFIXES.iter().any(|p| name.starts_with(p))
+    !NIC_EXCLUDE.iter().any(|p| name.contains(p))
 }
 
 /// Go collectDiskTotalAndUsed（monitor.go:333-348）：allowlist 非空时精确匹配
@@ -28,7 +42,7 @@ fn partition_included(mount: &str, fs: &str, allowlist: &[String]) -> bool {
     if !allowlist.is_empty() {
         return allowlist.iter().any(|m| m == mount);
     }
-    FS_ALLOWLIST.contains(&fs) && !MOUNT_EXCLUDE_PREFIXES.iter().any(|p| mount.starts_with(p))
+    FS_ALLOWLIST.contains(&fs) && !MOUNT_EXCLUDE_PREFIXES.iter().any(|p| mount.contains(p))
 }
 
 pub struct Monitor {
@@ -67,10 +81,15 @@ impl Monitor {
         self.disks.refresh(true);
         let mut total = 0u64;
         let mut used = 0u64;
+        let mut seen_devices = std::collections::HashSet::new();
         for d in self.disks.iter() {
             let fs = d.file_system().to_string_lossy().to_lowercase();
             let mount = d.mount_point().to_string_lossy();
             if !partition_included(&mount, &fs, &self.partition_allowlist) {
+                continue;
+            }
+            let device = d.name().to_string_lossy().to_string();
+            if !device.is_empty() && !seen_devices.insert(device) {
                 continue;
             }
             total += d.total_space();
@@ -169,7 +188,11 @@ impl Monitor {
                 String::new()
             },
             version: version.to_string(),
-            gpu: Vec::new(),
+            gpu: if caps.host_info && caps.gpu {
+                gpu_model_names()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -260,7 +283,7 @@ impl Monitor {
             } else {
                 Vec::new()
             },
-            gpu: 0.0,
+            gpu: if caps.gpu { gpu_utilization() } else { 0.0 },
         }
     }
 }
@@ -269,6 +292,127 @@ impl Default for Monitor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+static GPU_MODEL_FAILS: AtomicU32 = AtomicU32::new(0);
+static GPU_UTIL_FAILS: AtomicU32 = AtomicU32::new(0);
+
+fn gpu_try(counter: &AtomicU32) -> bool {
+    counter.load(Ordering::Relaxed) < 3
+}
+
+fn gpu_fail(counter: &AtomicU32) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn gpu_ok(counter: &AtomicU32) {
+    counter.store(0, Ordering::Relaxed);
+}
+
+fn run_smi(path: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(path).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn which_smi(preferred: &str, name: &str, args: &[&str]) -> Option<String> {
+    run_smi(preferred, args).or_else(|| run_smi(name, args))
+}
+
+/// 型号：nvidia-smi 名称，失败再 rocm。连续失败 3 次后本进程不再试。
+fn gpu_model_names() -> Vec<String> {
+    if !gpu_try(&GPU_MODEL_FAILS) {
+        return Vec::new();
+    }
+    if let Some(text) = which_smi(
+        "/usr/bin/nvidia-smi",
+        "nvidia-smi",
+        &["--query-gpu=name", "--format=csv,noheader"],
+    ) {
+        let names: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "[Not Supported]")
+            .map(str::to_string)
+            .collect();
+        if !names.is_empty() {
+            gpu_ok(&GPU_MODEL_FAILS);
+            return names;
+        }
+    }
+    if let Some(text) = which_smi("/opt/rocm/bin/rocm-smi", "rocm-smi", &["--showproductname"]) {
+        let names: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let (label, value) = line.split_once(':')?;
+                if !label.to_ascii_lowercase().contains("card model") {
+                    return None;
+                }
+                let value = value.trim();
+                if value.is_empty() || value.eq_ignore_ascii_case("N/A") {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            })
+            .collect();
+        if !names.is_empty() {
+            gpu_ok(&GPU_MODEL_FAILS);
+            return names;
+        }
+    }
+    gpu_fail(&GPU_MODEL_FAILS);
+    Vec::new()
+}
+
+/// 只取第一张卡。先 nvidia-smi -q -x 的 gpu_util，再 rocm-smi -u --json。
+fn gpu_utilization() -> f64 {
+    if !gpu_try(&GPU_UTIL_FAILS) {
+        return 0.0;
+    }
+    if let Some(xml) = which_smi("/usr/bin/nvidia-smi", "nvidia-smi", &["-q", "-x"])
+        && let Some(value) = first_tagged_number(&xml, "gpu_util")
+    {
+        gpu_ok(&GPU_UTIL_FAILS);
+        return value;
+    }
+    if let Some(json) = which_smi("/opt/rocm/bin/rocm-smi", "rocm-smi", &["-u", "--json"])
+        && let Some(value) = first_number_after(&json, "GPU use (%)")
+    {
+        gpu_ok(&GPU_UTIL_FAILS);
+        return value;
+    }
+    gpu_fail(&GPU_UTIL_FAILS);
+    0.0
+}
+
+fn first_tagged_number(xml: &str, tag: &str) -> Option<f64> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    xml[start..end]
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+}
+
+fn first_number_after(text: &str, needle: &str) -> Option<f64> {
+    let rest = text.get(text.find(needle)? + needle.len()..)?;
+    let mut digits = String::new();
+    let mut seen = false;
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            digits.push(ch);
+            seen = true;
+        } else if seen {
+            break;
+        }
+    }
+    digits.parse().ok()
 }
 
 fn collect_temperatures() -> Vec<pb::StateSensorTemperature> {

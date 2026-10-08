@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 prost = "0.14.4"
 rand = "0.10.2"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", features = ["pem"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"
@@ -15,13 +16,23 @@ sha2 = "0.11.0"
 sysinfo = "0.39.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 socket2 = "0.6"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync", "io-util"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 x509-parser = "0.16"
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio"] }
+wreq = { version = "0.16.1", default-features = false, features = ["tokio-rt", "webpki-roots"] }
+wreq-util = "0.2.0"
+if-addrs = "0.15.0"
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+webpki-roots = "1.0.9"
+http = "1.5.0"
+url = "2.5.8"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

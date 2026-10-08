@@ -22,8 +22,10 @@ cargo build --release
 面板一键安装（Linux amd64 / arm64，需本仓已发布 `v*` Release）：
 
 ```bash
-curl -fSL https://raw.githubusercontent.com/santaizi-group/santanzi-dashboard/main/script/install_agent_rs.sh | bash -s -- install_agent panel.example.com 5555 <secret> --clean-install --confirm-clean-install [--tls]
+curl -fSL https://raw.githubusercontent.com/santaizi-group/santanzi-dashboard/main/script/install_agent_rs.sh | bash -s -- install_agent panel.example.com 5555 <secret> --clean-install --confirm-clean-install [--tls] [--server-ip <主端IP>]
 ```
+
+能力开关、IP 上报和 `--server-ip` 与 Go 探针安装脚本相同，写入配置和拨号缓存；服务进程只带 `--config`。
 
 本机升级（保留配置 / 身份；同一条命令会识别 Rust 并从本仓换包）：
 
@@ -64,22 +66,21 @@ cp ../santaizi-agent/proto/santaizi.proto proto/santaizi.proto
 - **v2 通路（默认）**：Control（hello → 凭证/endpoint 指派，15s AgentRuntime，24h 刷新凭证）+ 按指派对 **primary 与从端** 各开 Ingest（hello → 1s 批量上送 → ack；空闲时 RealtimeSnapshot 与 15s Ping）。事件对齐 Go 探针：启动/退出 LIFECYCLE、HOST（10m + IP 变化）、STATE（5s）、HEARTBEAT（10s）；`event_id` = SHA256(node‖session‖seq) 前 16 字节。
 - **v1 回退**（`--protocol v1`）：unary `ReportSystemInfo` + 周期 `ReportSystemState`。
 - 认证：metadata `client_secret`；`tls: true` 时启动会 Enroll 设备证（`<data_dir>/pki/{client.key,client.crt,ca.crt}`），Control/Ingest 走 mTLS。仅当面板返回 `Unimplemented` 才回退密钥。到期前 `telemetry.cert_renew_days`（默认 7）天 Renew。**Enrollment 仅 v2 通路生效**；`--protocol v1` 无设备证，`tls: true` 只做 CA/根证书校验。
-- 可靠性：内存队列保留至 **各 endpoint 都 ack**（上限 4096，满丢最旧），断流 10s 重连；**无 WAL**，重启丢未确认事件。新从端不回放本 session 历史。
+- 可靠性：Segment WAL（`{data_dir}/wal`，帧格式与 Go 探针相同）。按 endpoint ack 后回收；压力到 85% 把 STATE 收成 1 分钟 rollup，顶满写 data-loss。重启重放未确认事件。新从端不回放本 session 更早的历史。
 - 身份：16 字节 node UUID 持久化 `<data_dir>/identity`（0600），每进程新 session。
-- 采集：CPU / 内存 / swap / 磁盘 / 网卡 / load / 进程 / Linux sockstat 连接数 / uptime / 虚拟化；温度需 `capabilities.temperature`。`nic_allowlist` / `hard_drive_partition_allowlist` 非空时只统计列表内网卡 / 挂载点（精确匹配，取代内置排除规则）。
-- 服务探测：HTTP / ICMP / TCP（无 uTLS、HTTP/3、Alt-Svc）。ICMP 优先走 Linux ping socket（SOCK_DGRAM，受内核 `net.ipv4.ping_group_range` 限制）；不支持时自动回退 raw socket（需 root 或 `CAP_NET_RAW`）。
-- IP 与归属地自查：双栈并行查 Cloudflare `/cdn-cgi/trace`，合并为 `v4/v6`（单栈即单边 IP）；`xx`/`t1` 忽略；`use_ipv6_countrycode: true` 时归属地取 v6 查询结果；双栈均失败 1 分钟快重试，成功回到 `ip_report_period`。
+- 采集：CPU / 内存 / swap / 磁盘 / 网卡 / load / 进程 / Linux sockstat 连接数 / uptime / 虚拟化；温度需 `capabilities.temperature`。`capabilities.gpu` 时上报型号和第一张卡利用率（nvidia-smi，失败再 rocm-smi）。`nic_allowlist` / `hard_drive_partition_allowlist` 非空时只统计列表内项。`ip_report_interface` 非空时流量和公网 IP 自查只走该网卡。
+- 服务探测：HTTP / ICMP / TCP。HTTP 使用 Chrome 系 ClientHello，并校验 Alt-Svc（`h3*` 走 HTTP/3）。ICMP 优先走 Linux ping socket（SOCK_DGRAM，受 `net.ipv4.ping_group_range` 限制）；不支持时回退 raw socket（需 root 或 `CAP_NET_RAW`）。
+- NAT：`capabilities.nat` 默认开启。控制流下发后向目标 TCP 建连，再走 `SantaiziNATService/NATStream`。
+- IP 与归属地自查：双栈并行查 Cloudflare `/cdn-cgi/trace`，合并为 `v4/v6`；`xx`/`t1` 忽略；`use_ipv6_countrycode: true` 时归属地取 v6；双栈均失败且周期大于 60 秒时 1 分钟快重试。
+- 拨号：自定义 `dns`（空则轮换内置公共 DNS）。成功解析写入 `{data_dir}/endpoint-cache.json`，失败用缓存。`insecure_tls` / `-k` 跳过证书校验，仅测试。
 - 明文或 TLS（webpki 根证书；自签用 `tls_ca_file` 或 Enrollment CA）。
 
 ## 明确不做（相对 Go 探针）
 
 | 能力 | 说明 |
 | ---- | ---- |
-| WAL 可靠重放 | 内存队列；断网超上限或重启会丢事件 |
-| NAT 穿透 | 收到 NATOpenRequest 回拒绝 |
-| GPU | 不上报；`capabilities.gpu` 无效 |
-| HTTP 探测增强 | 无 uTLS / HTTP/3 / Alt-Svc |
-| insecure_tls | rustls 不支持跳过校验，用 `tls_ca_file` |
-| 自定义 DNS resolver（`dns` 键） | 忽略该键，走系统解析 |
-| `ip_report_interface` 绑网卡 | HTTP client 不支持按接口拨号，忽略该键 |
-| Windows 服务 / `agent edit` / `service install` | 未实现 |
+| 非 Linux | 只发 linux amd64 / arm64 |
+| Windows 服务 / `agent edit` / `service install` | 安装仍走面板脚本 |
+| v1 通路 | 保留 unary 回退，不补 Enrollment、WAL、探测 |
+| ClientHello 字节级一致 | HTTP 探测是 Chrome 系指纹，不是 Go `HelloChrome_Auto` 的逐字节拷贝 |
+| ICMP 只能 raw | 保留 ping socket 优先。无 `CAP_NET_RAW` 时 Go 会失败 |

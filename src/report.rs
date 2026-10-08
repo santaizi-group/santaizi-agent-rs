@@ -3,6 +3,7 @@ use crate::monitor::Monitor;
 use crate::netip::{self, IpInfo};
 use crate::pb::santaizi_service_client::SantaiziServiceClient;
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -49,6 +50,7 @@ pub fn build_channel_with_identity(
     build_endpoint_channel(
         &cfg.server,
         cfg.tls,
+        cfg.insecure_tls,
         &cfg.tls_ca_file,
         &[],
         identity,
@@ -56,10 +58,11 @@ pub fn build_channel_with_identity(
     )
 }
 
-/// 按单个 endpoint 建连。`insecure_tls` 由调用方忽略（rustls 不能跳过校验）。
+/// 按单个 endpoint 建连。`insecure_tls` 跳过服务端证书校验（仅测试，调用方须打 Warning）。
 pub fn build_endpoint_channel(
     server: &str,
     tls: bool,
+    insecure_tls: bool,
     tls_ca_file: &str,
     extra_ca_pem: &[u8],
     identity: Option<&Identity>,
@@ -78,26 +81,102 @@ pub fn build_endpoint_channel(
         endpoint = endpoint.timeout(RPC_TIMEOUT);
     }
     if tls {
-        let mut tls_cfg = ClientTlsConfig::new()
-            .domain_name(tls_server_name(server))
-            .with_webpki_roots();
-        let mut pem = Vec::new();
-        if !tls_ca_file.is_empty() {
-            pem.extend(std::fs::read(tls_ca_file).context("读取 tls_ca_file 失败")?);
-        }
-        if !extra_ca_pem.is_empty() {
-            if !pem.is_empty() {
-                pem.push(b'\n');
+        let domain = tls_server_name(server);
+        if insecure_tls {
+            // 自定义 verifier 不能再配 CA / webpki roots，否则 tonic 直接报错。
+            let mut tls_cfg = ClientTlsConfig::new().domain_name(domain);
+            if let Some(identity) = identity {
+                tls_cfg = tls_cfg.identity(identity.clone());
             }
-            pem.extend_from_slice(extra_ca_pem);
+            endpoint = endpoint
+                .tls_config_with_verifier(tls_cfg, Arc::new(SkipServerVerify))
+                .context("TLS 配置失败")?;
+        } else {
+            let mut tls_cfg = ClientTlsConfig::new()
+                .domain_name(domain)
+                .with_webpki_roots();
+            let mut pem = Vec::new();
+            if !tls_ca_file.is_empty() {
+                pem.extend(std::fs::read(tls_ca_file).context("读取 tls_ca_file 失败")?);
+            }
+            if !extra_ca_pem.is_empty() {
+                if !pem.is_empty() {
+                    pem.push(b'\n');
+                }
+                pem.extend_from_slice(extra_ca_pem);
+            }
+            if !pem.is_empty() {
+                tls_cfg = tls_cfg.ca_certificate(Certificate::from_pem(pem));
+            }
+            if let Some(identity) = identity {
+                tls_cfg = tls_cfg.identity(identity.clone());
+            }
+            endpoint = endpoint.tls_config(tls_cfg).context("TLS 配置失败")?;
         }
-        if !pem.is_empty() {
-            tls_cfg = tls_cfg.ca_certificate(Certificate::from_pem(pem));
+    }
+    Ok(endpoint.connect_lazy())
+}
+
+/// 拨到已解析地址，SNI / authority 用 `target.server_name`（不带端口）。
+pub fn dial_target(
+    cfg: &Config,
+    target: &crate::dialcache::Target,
+    extra_ca_pem: &[u8],
+    identity: Option<&Identity>,
+    streaming: bool,
+) -> Result<Channel> {
+    let scheme = if cfg.tls { "https" } else { "http" };
+    let mut endpoint = Endpoint::from_shared(format!("{scheme}://{}", target.dial_addr))
+        .map_err(|err| anyhow::anyhow!("server 地址无效，应为 host:port: {err}"))?
+        .connect_timeout(Duration::from_secs(5))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)));
+    if !streaming {
+        endpoint = endpoint.timeout(RPC_TIMEOUT);
+    }
+    let origin_host = if target.server_name.contains(':') && !target.server_name.starts_with('[') {
+        format!("[{}]", target.server_name)
+    } else {
+        target.server_name.clone()
+    };
+    let origin: tonic::transport::Uri = format!("{scheme}://{origin_host}")
+        .parse()
+        .context("dial origin")?;
+    endpoint = endpoint.origin(origin);
+    if cfg.tls {
+        let domain = target.server_name.clone();
+        if cfg.insecure_tls {
+            let mut tls_cfg = ClientTlsConfig::new().domain_name(domain);
+            if let Some(identity) = identity {
+                tls_cfg = tls_cfg.identity(identity.clone());
+            }
+            endpoint = endpoint
+                .tls_config_with_verifier(tls_cfg, Arc::new(SkipServerVerify))
+                .context("TLS 配置失败")?;
+        } else {
+            let mut tls_cfg = ClientTlsConfig::new()
+                .domain_name(domain)
+                .with_webpki_roots();
+            let mut pem = Vec::new();
+            if !cfg.tls_ca_file.is_empty() {
+                pem.extend(std::fs::read(&cfg.tls_ca_file).context("读取 tls_ca_file 失败")?);
+            }
+            if !extra_ca_pem.is_empty() {
+                if !pem.is_empty() {
+                    pem.push(b'\n');
+                }
+                pem.extend_from_slice(extra_ca_pem);
+            }
+            if !pem.is_empty() {
+                tls_cfg = tls_cfg.ca_certificate(Certificate::from_pem(pem));
+            }
+            if let Some(identity) = identity {
+                tls_cfg = tls_cfg.identity(identity.clone());
+            }
+            endpoint = endpoint.tls_config(tls_cfg).context("TLS 配置失败")?;
         }
-        if let Some(identity) = identity {
-            tls_cfg = tls_cfg.identity(identity.clone());
-        }
-        endpoint = endpoint.tls_config(tls_cfg).context("TLS 配置失败")?;
     }
     Ok(endpoint.connect_lazy())
 }
@@ -176,9 +255,65 @@ pub async fn run(cfg: Config, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// 对齐 Go `InsecureSkipVerify`：不校验证书链、主机名和握手签名。
+#[derive(Debug)]
+pub struct SkipServerVerify;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tls_server_name;
+    use super::{build_endpoint_channel, tls_server_name};
+
+    #[tokio::test]
+    async fn insecure_tls_builds_without_ca() {
+        let channel = build_endpoint_channel("127.0.0.1:1", true, true, "", &[], None, true);
+        assert!(channel.is_ok(), "{channel:?}");
+    }
 
     #[test]
     fn tls_server_name_strips_port() {

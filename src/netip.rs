@@ -80,13 +80,61 @@ fn merge_stacks(v4: &StackInfo, v6: &StackInfo, use_ipv6_countrycode: bool) -> O
 
 /// 逐域名解析出 v4/v6 地址并分别钉进两个 client，强制各栈走各自协议族；
 /// 某个域名解析失败仅跳过该域名的钉扎（回退系统解析，栈归属仍由响应 ip 字段校验兜底）。
-async fn build_stack_clients(timeout: Duration) -> Result<(reqwest::Client, reqwest::Client)> {
+fn bindable(ip: IpAddr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+    }
+}
+
+/// 网卡上的全球单播地址。空名字返回 (None, None)。
+pub fn interface_locals(name: &str) -> (Option<IpAddr>, Option<IpAddr>) {
+    let name = name.trim();
+    if name.is_empty() {
+        return (None, None);
+    }
+    let Ok(list) = if_addrs::get_if_addrs() else {
+        return (None, None);
+    };
+    let mut v4 = None;
+    let mut v6 = None;
+    for iface in list {
+        if iface.name != name {
+            continue;
+        }
+        let ip = iface.ip();
+        if !bindable(ip) {
+            continue;
+        }
+        match ip {
+            IpAddr::V4(_) if v4.is_none() => v4 = Some(ip),
+            IpAddr::V6(_) if v6.is_none() => v6 = Some(ip),
+            _ => {}
+        }
+    }
+    (v4, v6)
+}
+
+async fn build_stack_clients(
+    timeout: Duration,
+    iface: &str,
+) -> Result<(reqwest::Client, reqwest::Client)> {
+    let (local_v4, local_v6) = interface_locals(iface);
     let mut b4 = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(TRACE_UA);
     let mut b6 = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(TRACE_UA);
+    if let Some(ip) = local_v4 {
+        b4 = b4.local_address(ip);
+    }
+    if let Some(ip) = local_v6 {
+        b6 = b6.local_address(ip);
+    }
     for url in TRACE_URLS {
         let host = reqwest::Url::parse(url)
             .ok()
@@ -138,8 +186,8 @@ async fn fetch_stack(client: &reqwest::Client, v6: bool) -> StackInfo {
     StackInfo::default()
 }
 
-async fn fetch_dual(timeout: Duration, use_ipv6_countrycode: bool) -> Result<IpInfo> {
-    let (c4, c6) = build_stack_clients(timeout).await?;
+async fn fetch_dual(timeout: Duration, use_ipv6_countrycode: bool, iface: &str) -> Result<IpInfo> {
+    let (c4, c6) = build_stack_clients(timeout, iface).await?;
     let (v4, v6) = tokio::join!(fetch_stack(&c4, false), fetch_stack(&c6, true));
     merge_stacks(&v4, &v6, use_ipv6_countrycode)
         .ok_or_else(|| anyhow::anyhow!("v4/v6 双栈自查均失败"))
@@ -147,20 +195,25 @@ async fn fetch_dual(timeout: Duration, use_ipv6_countrycode: bool) -> Result<IpI
 
 /// v1 通路（report.rs）入口：双栈合并 IP，国家码固定取 v4 口径（Go 默认）。
 pub fn fetch_ip_info(timeout: Duration) -> Result<IpInfo> {
-    fetch_ip_info_with(timeout, false)
+    fetch_ip_info_with(timeout, false, "")
 }
 
-/// `use_ipv6_countrycode=true` 时国家码取 v6 查询的 loc（Go use_ipv6_countrycode）。
-/// 调用方经 spawn_blocking 进入；独立线程跑临时运行时，避免在可能已进入
-/// runtime 上下文的线程里嵌套 block_on。
-pub fn fetch_ip_info_with(timeout: Duration, use_ipv6_countrycode: bool) -> Result<IpInfo> {
+/// `use_ipv6_countrycode=true` 时国家码取 v6 查询的 loc。
+/// `iface` 非空时用该网卡的全球单播地址做本地地址。
+/// 调用方经 spawn_blocking 进入；独立线程跑临时运行时，避免嵌套 block_on。
+pub fn fetch_ip_info_with(
+    timeout: Duration,
+    use_ipv6_countrycode: bool,
+    iface: &str,
+) -> Result<IpInfo> {
+    let iface = iface.to_string();
     std::thread::scope(|s| {
         s.spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .context("创建 IP 自查运行时失败")?
-                .block_on(fetch_dual(timeout, use_ipv6_countrycode))
+                .block_on(fetch_dual(timeout, use_ipv6_countrycode, &iface))
         })
         .join()
         .map_err(|_| anyhow::anyhow!("IP 自查线程异常退出"))?

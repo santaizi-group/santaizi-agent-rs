@@ -335,7 +335,7 @@ async fn v2_control_ingest_roundtrip() {
     assert!(enabled.contains(&(pb::AgentCapability::ProbeHttp as i32)));
     assert!(enabled.contains(&(pb::AgentCapability::ProbeTcp as i32)));
     assert!(enabled.contains(&(pb::AgentCapability::ProbeIcmp as i32)));
-    assert!(!enabled.contains(&(pb::AgentCapability::Nat as i32)));
+    assert!(enabled.contains(&(pb::AgentCapability::Nat as i32)));
 
     // Ingest：hello 走 primary、带上指派 generation 与凭证。
     assert_eq!(
@@ -544,7 +544,7 @@ async fn v2_collector_ingest_and_tcp_probe() {
     assert_eq!(results[0].probe_id, "tcp-e2e");
 }
 
-/// 并发上限 32：慢目标占满许可后，超出的 probe 必须立即回失败结果而不是排队。
+/// 探测与 NAT 共用 16 个槽：慢目标占满后，超出的 probe 必须立即回失败结果。
 #[tokio::test]
 async fn v2_probe_concurrency_limit() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -630,9 +630,15 @@ async fn v2_probe_concurrency_limit() {
     assert_eq!(results.len(), PROBE_COUNT, "每个 probe 都必须有结果");
     let rejected = results
         .iter()
-        .filter(|r| r.error.contains("concurrency limit"))
+        .filter(|r| r.error == "too many concurrent probes")
         .count();
     let ok = results.iter().filter(|r| r.successful).count();
-    assert_eq!(rejected, PROBE_COUNT - 32, "超过上限的必须立即拒绝");
-    assert_eq!(ok, 32, "上限内的必须执行成功");
+    assert_eq!(rejected, PROBE_COUNT - 16, "超过上限的必须立即拒绝");
+    assert_eq!(ok, 16, "上限内的必须执行成功");
+    assert!(
+        results
+            .iter()
+            .filter(|r| r.error == "too many concurrent probes")
+            .all(|r| r.kind == 0)
+    );
 }
