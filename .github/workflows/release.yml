@@ -27,7 +27,10 @@ jobs:
       contents: write
     env:
       CARGO_TERM_COLOR: always
+      # btls-sys builds BoringSSL with CMake and only reads CC_/CXX_<target>.
+      # A host g++ emits x86_64 objects (EM: 62) that aarch64-linux-gnu-ld rejects.
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +60,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
