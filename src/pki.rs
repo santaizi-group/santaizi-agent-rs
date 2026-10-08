@@ -459,6 +459,20 @@ mod tests {
         std::env::temp_dir().join(format!("santaizi-pki-{tag}-{}", std::process::id()))
     }
 
+    /// 登记会打开拨号缓存。默认 data_dir 是 `/var/lib/santaizi-agent`，CI 上没有写权限。
+    fn enroll_cfg(server: String, secret: &str, dir: &std::path::Path) -> Config {
+        Config {
+            server,
+            client_secret: secret.into(),
+            tls: false,
+            telemetry: crate::config::TelemetryConfig {
+                data_dir: dir.to_string_lossy().into(),
+                ..Default::default()
+            },
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn save_load_roundtrip() {
         let dir = test_dir("roundtrip");
@@ -610,12 +624,9 @@ mod tests {
                 .serve(addr),
         );
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let cfg = Config {
-            server: addr.to_string(),
-            client_secret: "enroll-secret".into(),
-            tls: false,
-            ..Config::default()
-        };
+        let dir = test_dir("enroll-once");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = enroll_cfg(addr.to_string(), "enroll-secret", &dir);
         let bundle = enroll_once(&cfg, [9u8; 16], "0.1.0-test")
             .await
             .expect("enroll");
@@ -626,6 +637,7 @@ mod tests {
         );
         assert!(*mock.csr_len.lock().unwrap() > 0);
         server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -643,14 +655,12 @@ mod tests {
                 .serve(addr),
         );
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let cfg = Config {
-            server: addr.to_string(),
-            client_secret: "x".into(),
-            tls: false,
-            ..Config::default()
-        };
+        let dir = test_dir("enroll-unimpl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = enroll_cfg(addr.to_string(), "x", &dir);
         let err = enroll_once(&cfg, [1u8; 16], "test").await.unwrap_err();
         assert!(is_unimplemented(&err), "{err:#}");
         server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
