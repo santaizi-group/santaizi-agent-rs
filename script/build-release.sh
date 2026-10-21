@@ -71,4 +71,20 @@ if ! command -v protoc >/dev/null 2>&1; then
 fi
 # 镜像的 CARGO_BUILD_TARGET 已指向对应 musl 目标。
 cargo build --release --locked
+
+# 自检：产物必须静态、且不带任何 glibc 版本需求。gnu 产物会把构建机 glibc 的
+# 版本需求写进 ELF，旧系统 loader 直接拒启——systemd 里只看到 status=1/FAILURE，
+# 应用一行日志都没有（v1.0.6 就是这样）。每次构建都挡一道，别靠人记得。
+# file 对 x86_64 输出 static-pie linked、aarch64 输出 statically linked，
+# 两种都是全静态（无 INTERP、无 NEEDED），所以只匹配 static。
+bin="target/${CARGO_BUILD_TARGET}/release/santaizi-agent-rs"
+file "$bin" | grep -q "static" || {
+    echo "产物不是静态链接：$(file "$bin")" >&2
+    exit 1
+}
+if objdump -T "$bin" | grep -q GLIBC; then
+    echo "产物仍带 glibc 版本需求：" >&2
+    objdump -T "$bin" | grep GLIBC | head -3 >&2
+    exit 1
+fi
 '
