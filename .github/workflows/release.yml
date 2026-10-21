@@ -14,10 +14,15 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # 发布产物是静态 musl（script/build-release.sh），不带 glibc，
+          # 任何 Linux 都能跑；Go 探针静态链接也是同一取向。
+          # target 选镜像，triple 是 cargo 目标（产物路径用 triple）。
+          - target: x86_64-musl
+            triple: x86_64-unknown-linux-musl
             goos: linux
             goarch: amd64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-musl
+            triple: aarch64-unknown-linux-musl
             goos: linux
             goarch: arm64
 
@@ -25,13 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      CARGO_TERM_COLOR: always
-      # btls-sys builds BoringSSL with CMake and only reads CC_/CXX_<target>.
-      # A host g++ emits x86_64 objects (EM: 62) that aarch64-linux-gnu-ld rejects.
-      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,24 +46,6 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install aarch64 GNU toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
       - name: Sync crate version from tag
         shell: bash
         run: |
@@ -74,14 +54,18 @@ jobs:
           # Only bump [package] version, not dependency versions.
           sed -i '0,/^version = /s/^version = ".*"/version = "'"${version}"'"/' Cargo.toml
 
+      # 不能直接在 runner 上 cargo build：ubuntu-latest 是 glibc 2.39，产物会要求
+      # GLIBC_2.38/2.39，Debian 11/12、Ubuntu 20.04/22.04 的 loader 拒绝启动
+      # （systemd 里只看到 status=1/FAILURE）。改为容器里出静态 musl 产物，
+      # 细节见 script/build-release.sh。
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: ./script/build-release.sh ${{ matrix.target }}
 
       - name: Archive
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/santaizi-agent-rs" dist/santaizi-agent-rs
+          cp "target/${{ matrix.triple }}/release/santaizi-agent-rs" dist/santaizi-agent-rs
           zip -j "dist/santaizi-agent-rs_${{ matrix.goos }}_${{ matrix.goarch }}.zip" dist/santaizi-agent-rs
 
       # Private repos on GitHub Free share a ~500MB Actions artifact quota

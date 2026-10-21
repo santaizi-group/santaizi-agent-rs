@@ -55,34 +55,14 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
-  # Release is the only other place that links aarch64. BoringSSL's C++ objects
-  # must be built with the cross g++; catch that before the next tag.
+  # 发布产物只在这一个容器里链接 arm64（静态 musl）。BoringSSL 的 C++ 必须走
+  # 交叉 g++：宿主 g++ 产出 x86_64 对象（EM: 62），aarch64-linux-gnu-ld 直接拒链。
+  # 这里跑同一条 script/build-release.sh，别等打 tag 才发现发版链断了。
   cross:
-    name: Cross build (linux arm64)
+    name: Cross build (linux arm64, static musl)
     runs-on: ubuntu-latest
-    env:
-      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install aarch64 GNU toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-unknown-linux-gnu
-
       - name: Build
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+        run: ./script/build-release.sh aarch64-musl

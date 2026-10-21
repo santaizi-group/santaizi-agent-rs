@@ -25,6 +25,8 @@ cargo build --release
 curl -fSL https://raw.githubusercontent.com/santaizi-group/santanzi-dashboard/main/script/install_agent_rs.sh | bash -s -- install_agent panel.example.com 5555 <secret> --clean-install --confirm-clean-install [--tls] [--server-ip <主端IP>]
 ```
 
+发布产物是**静态 musl**（无 glibc 依赖，和 Go 探针静态链接同一取向），任何 Linux 都能起：CentOS 7 的 glibc 2.17 到最新 Debian / Ubuntu 都不用管。本地 `cargo build` 出来的是宿主编译器对应形态，仅供开发调试。
+
 能力开关、IP 上报和 `--server-ip` 与 Go 探针安装脚本相同，写入配置和拨号缓存；服务进程只带 `--config`。
 
 本机升级（保留配置 / 身份；同一条命令会识别 Rust 并从本仓换包）：
@@ -60,6 +62,14 @@ cp ../santaizi-agent/proto/santaizi.proto proto/santaizi.proto
 ```
 
 打 tag `vMAJOR.MINOR.PATCH`（允许 v0.x）会构建并发布 `linux/amd64`、`linux/arm64` zip。
+
+发版产物（含 CI 与本地）一律走 `script/build-release.sh`，在固定容器里编静态 musl：
+
+```bash
+./script/build-release.sh x86_64-musl      # 或 aarch64-musl；产物在 target/<triple>/release/
+```
+
+不要直接在 glibc 2.38+ 的机器（含 GitHub 的 `ubuntu-latest`）上 `cargo build --release` 当发布产物：那样链出来的二进制会要求 `GLIBC_2.38` / `GLIBC_2.39`，旧系统 loader 直接报 `version 'GLIBC_2.38' not found` 拒启，systemd 里只看到 `status=1/FAILURE`。脚本头注释有完整来龙去脉。
 
 ## 当前能力
 
