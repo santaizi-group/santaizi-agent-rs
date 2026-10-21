@@ -51,8 +51,15 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          pkg="$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           # Only bump [package] version, not dependency versions.
           sed -i '0,/^version = /s/^version = ".*"/version = "'"${version}"'"/' Cargo.toml
+          # Cargo.lock 里本包版本必须一起同步：构建用 --locked，toml 单独 bump
+          # 会被拒（v1.0.7 首跑即撞：cannot update the lock file）。tag 打在
+          # 未 bump 版本的提交上时这个同步就不是空操作。
+          sed -i "/^name = \"${pkg}\"\$/{n;s/^version = \".*\"/version = \"${version}\"/}" Cargo.lock
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$version"
+          grep -A1 "^name = \"${pkg}\"" Cargo.lock | tail -1 | grep -qx "version = \"${version}\""
 
       # 不能直接在 runner 上 cargo build：ubuntu-latest 是 glibc 2.39，产物会要求
       # GLIBC_2.38/2.39，Debian 11/12、Ubuntu 20.04/22.04 的 loader 拒绝启动
