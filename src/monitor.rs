@@ -154,7 +154,7 @@ impl Monitor {
                 String::new()
             },
             platform_version: if caps.host_info {
-                System::os_version().unwrap_or_default()
+                os_version()
             } else {
                 String::new()
             },
@@ -520,6 +520,29 @@ fn os_id() -> String {
         .unwrap_or_default()
 }
 
+/// Linux 的发行版版本号。Debian 点位号只写在 `/etc/debian_version`（`12.15`），
+/// `/etc/os-release` 的 `VERSION_ID` 恒为主版本（`12`），sysinfo 只读后者。
+fn os_version() -> String {
+    #[cfg(target_os = "linux")]
+    if os_id() == "debian"
+        && let Ok(text) = std::fs::read_to_string("/etc/debian_version")
+        && let Some(version) = debian_point_version(&text)
+    {
+        return version;
+    }
+    System::os_version().unwrap_or_default()
+}
+
+/// `/etc/debian_version` 稳定版是点位号（`12.15`），测试版是 `bookworm/sid`，后者不是版本。
+fn debian_point_version(text: &str) -> Option<String> {
+    let first = text.lines().next().unwrap_or_default().trim();
+    first
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+        .then(|| first.to_string())
+}
+
 /// Linux 读 /proc/net/sockstat{,6} 的 inuse；其余平台 MVP 先给 0。
 #[cfg(target_os = "linux")]
 fn sockstat_counts() -> (u64, u64) {
@@ -599,6 +622,18 @@ mod tests {
             !partition_included("/data/sub", "ext4", &allow),
             "精确匹配挂载点"
         );
+    }
+
+    #[test]
+    fn debian_point_version_accepts_point_release() {
+        assert_eq!(debian_point_version("12.15\n"), Some("12.15".to_string()));
+        assert_eq!(debian_point_version("13.6"), Some("13.6".to_string()));
+    }
+
+    #[test]
+    fn debian_point_version_rejects_non_versions() {
+        assert_eq!(debian_point_version("trixie/sid\n"), None);
+        assert_eq!(debian_point_version(""), None);
     }
 
     #[test]
